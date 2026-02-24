@@ -221,7 +221,7 @@ class LeRobotMotusDataset(data.Dataset):
 
             self.episode_ids = all_ep_ids
         elif self.task_mode == "multi":
-            if self.task_name == None:
+            if self.task_name is None:
                 self.repo_ids = [task_name for task_name in os.listdir(self.root) if os.path.isdir(os.path.join(self.root, task_name))]
             elif isinstance(self.task_name, list):
                 self.repo_ids = self.task_name

@@ -19,6 +19,10 @@ import tempfile
 # VLM processing imports
 from utils.vlm_utils import preprocess_vlm_messages
 from transformers import AutoProcessor
+try:
+    from transformers import Qwen2VLProcessor
+except ImportError:
+    Qwen2VLProcessor = None
 
 # Import image processing utilities
 from data.utils.image_utils import (
@@ -29,6 +33,21 @@ from data.utils.image_utils import (
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*multichannel.*")
 
 logger = logging.getLogger(__name__)
+
+
+def _load_vlm_processor(vlm_checkpoint_path: str):
+    processor = AutoProcessor.from_pretrained(vlm_checkpoint_path, trust_remote_code=True)
+    if hasattr(processor, "image_processor"):
+        return processor
+
+    if Qwen2VLProcessor is not None:
+        logger.warning(
+            "AutoProcessor returned %s without image_processor; falling back to Qwen2VLProcessor",
+            processor.__class__.__name__,
+        )
+        return Qwen2VLProcessor.from_pretrained(vlm_checkpoint_path, trust_remote_code=True)
+
+    return processor
 
 class RobotWinTaskDataset(data.Dataset):
     """
@@ -70,6 +89,7 @@ class RobotWinTaskDataset(data.Dataset):
         
         # VLM processing parameters
         vlm_checkpoint_path: Optional[str] = None,  # Path to VLM model
+        extended_action_multiplier: int = 1,
     ):
         """
         Initialize RobotWin dataset with flexible sampling.
@@ -110,6 +130,8 @@ class RobotWinTaskDataset(data.Dataset):
         self.upsample_rate = upsample_rate
         self.val = val
         self.image_aug = image_aug
+        self.extended_action_multiplier = max(1, int(extended_action_multiplier or 1))
+        self.extended_action_chunk_size = self.action_chunk_size * self.extended_action_multiplier
         
         # Validate parameters
         if task_mode == "single" and not task_name:
@@ -136,13 +158,15 @@ class RobotWinTaskDataset(data.Dataset):
         logger.info(f"  Video:Action frequency ratio: {video_action_freq_ratio}")
         logger.info(f"  Action chunk size: {self.action_chunk_size}")
         logger.info(f"  Video frames to predict: {num_video_frames}")
+        logger.info(f"  Extended action multiplier: {self.extended_action_multiplier}")
+        logger.info(f"  Extended action chunk size: {self.extended_action_chunk_size}")
         logger.info(f"  Total episodes: {self.total_episodes}")
         
         # Initialize VLM processor for complete VLM processing in dataset
         self.vlm_processor = None
         if vlm_checkpoint_path is not None:
             try:
-                self.vlm_processor = AutoProcessor.from_pretrained(vlm_checkpoint_path)
+                self.vlm_processor = _load_vlm_processor(vlm_checkpoint_path)
                 logger.info(f"VLM processor loaded from {vlm_checkpoint_path}")
             except Exception as e:
                 logger.warning(f"Failed to load VLM processor from {vlm_checkpoint_path}: {e}")
@@ -334,7 +358,7 @@ class RobotWinTaskDataset(data.Dataset):
         # initial_state = self._normalize_actions(initial_state.unsqueeze(0)).squeeze(0)  # Normalize state same way as actions
         
         return initial_state, action_sequence
-    
+
     def _load_language_embedding(self, lang_path: str) -> tuple[torch.Tensor, int]:
         """Load pre-encoded language embedding and return the selected index."""
         try:
@@ -414,8 +438,8 @@ class RobotWinTaskDataset(data.Dataset):
             - video_indices: List of video frame indices to predict
             - action_indices: List of action frame indices to predict
         """
-        # Calculate physical span of one chunk
-        physical_chunk_size = self.action_chunk_size * self.global_downsample_rate
+        # Ensure the sampled condition frame can provide the full extended action horizon.
+        physical_chunk_size = self.extended_action_chunk_size * self.global_downsample_rate
         
         # Sample condition frame directly in physical space
         # Ensure the last action doesn't exceed total_frames - 1
@@ -448,7 +472,15 @@ class RobotWinTaskDataset(data.Dataset):
             intervals = [action_indices[i+1] - action_indices[i] for i in range(len(action_indices)-1)]
             # print(f"  Action interval verification: {set(intervals)} (should all be {self.global_downsample_rate})")
         
-        return condition_frame_idx, video_indices, action_indices
+        extended_action_indices = action_indices
+        if self.extended_action_multiplier > 1:
+            extended_action_indices = []
+            for i in range(self.extended_action_chunk_size):
+                action_idx = condition_frame_idx + (i + 1) * self.global_downsample_rate
+                extended_action_indices.append(min(action_idx, total_frames - 1))
+            action_indices = extended_action_indices[:self.action_chunk_size]
+
+        return condition_frame_idx, video_indices, action_indices, extended_action_indices
     
     def __len__(self) -> int:
         """Return approximate dataset length."""
@@ -492,12 +524,19 @@ class RobotWinTaskDataset(data.Dataset):
                     continue
 
                 # Calculate sampling indices
-                condition_frame_idx, video_indices, action_indices = self._calculate_sampling_indices(total_frames)
+                condition_frame_idx, video_indices, action_indices, extended_action_indices = self._calculate_sampling_indices(total_frames)
 
                 # Load frames and aligned robot/action data
                 first_frame = load_video_frames(episode_data['video_path'], [condition_frame_idx], self.video_size)
                 video_frames = load_video_frames(episode_data['video_path'], video_indices, self.video_size)
                 initial_state, action_sequence = self._load_robot_data(episode_data['qpos_path'], action_indices, condition_frame_idx)
+                extended_action_sequence = None
+                if self.extended_action_multiplier > 1:
+                    _, extended_action_sequence = self._load_robot_data(
+                        episode_data['qpos_path'],
+                        extended_action_indices,
+                        condition_frame_idx,
+                    )
                 language_embedding, instruction_idx = self._load_language_embedding(episode_data['lang_path'])
 
                 # Infer split from paths
@@ -528,14 +567,26 @@ class RobotWinTaskDataset(data.Dataset):
                     first_frame_pil = tensor_to_pil(first_frame.squeeze(0))
                     vlm_inputs = preprocess_vlm_messages(text_instruction, first_frame_pil, self.vlm_processor)
 
-                return {
+                sample = {
                     'first_frame': first_frame.squeeze(0),
                     'video_frames': video_frames,
                     'initial_state': initial_state,
                     'action_sequence': action_sequence,
                     'language_embedding': language_embedding,
                     'vlm_inputs': vlm_inputs,
+                    'condition_frame_idx': torch.tensor(condition_frame_idx, dtype=torch.long),
+                    'video_indices': torch.tensor(video_indices, dtype=torch.long),
+                    'action_indices': torch.tensor(action_indices, dtype=torch.long),
                 }
+                if extended_action_sequence is not None:
+                    sample.update(
+                        {
+                            'extended_action_sequence': extended_action_sequence,
+                            'extended_action_indices': torch.tensor(extended_action_indices, dtype=torch.long),
+                        }
+                    )
+
+                return sample
 
             except Exception as e:
                 logger.warning(f"Retry due to sample error ({episode_data.get('episode_name','?')}): {e}")

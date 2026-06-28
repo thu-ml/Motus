@@ -172,7 +172,8 @@ class WanSelfAttention(nn.Module):
                 action_v: torch.Tensor = None,
                 und_q: torch.Tensor = None,
                 und_k: torch.Tensor = None,
-                und_v: torch.Tensor = None):
+                und_v: torch.Tensor = None,
+                attn_mask: torch.Tensor = None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -229,12 +230,137 @@ class WanSelfAttention(nn.Module):
             k_cat = torch.cat(k_parts, dim=1)
             v_cat = torch.cat(v_parts, dim=1)
 
-            attn_out = flash_attention(
-                q=q_cat,
-                k=k_cat,
-                v=v_cat,
-                k_lens=seq_lens,
-                window_size=self.window_size)
+            if isinstance(attn_mask, dict) and attn_mask.get("type") in {
+                "extended_prefix_isolation",
+                "extended_chunk_causal",
+            }:
+                video_token_len = int(attn_mask["video_token_len"])
+                action_token_len = int(attn_mask["action_token_len"])
+                und_token_len = int(attn_mask["und_token_len"])
+                prefix_video_token_len = int(attn_mask["prefix_video_token_len"])
+                future_action_start = int(attn_mask["future_action_start"])
+                future_action_end = int(attn_mask["future_action_end"])
+                total_len = video_token_len + action_token_len + und_token_len
+                if total_len != q_cat.size(1):
+                    raise ValueError(
+                        "Prefix-isolation mask length mismatch: "
+                        f"mask={total_len}, q={q_cat.size(1)}"
+                    )
+
+                device = q_cat.device
+                index_parts = []
+                future_parts = []
+
+                def add_range(parts, start, end):
+                    if start < end:
+                        parts.append(torch.arange(start, end, device=device))
+
+                add_range(index_parts, 0, min(prefix_video_token_len, video_token_len))
+                add_range(index_parts, video_token_len, video_token_len + future_action_start)
+                add_range(index_parts, video_token_len + action_token_len, total_len)
+
+                add_range(future_parts, prefix_video_token_len, video_token_len)
+                add_range(
+                    future_parts,
+                    video_token_len + future_action_start,
+                    video_token_len + future_action_end,
+                )
+
+                if future_parts:
+                    prefix_idx = torch.cat(index_parts, dim=0)
+                    future_idx = torch.cat(future_parts, dim=0)
+                    prefix_out = flash_attention(
+                        q=q_cat.index_select(1, prefix_idx),
+                        k=k_cat.index_select(1, prefix_idx),
+                        v=v_cat.index_select(1, prefix_idx),
+                        window_size=self.window_size)
+                    attn_out = torch.empty_like(q_cat)
+                    attn_out.index_copy_(1, prefix_idx, prefix_out)
+
+                    if attn_mask.get("type") == "extended_chunk_causal":
+                        chunk_indices = []
+                        previous_key_parts = [prefix_idx]
+                        for chunk_range in attn_mask.get("future_chunk_ranges", []):
+                            chunk_parts = []
+                            add_range(
+                                chunk_parts,
+                                int(chunk_range.get("video_start", 0)),
+                                int(chunk_range.get("video_end", 0)),
+                            )
+                            add_range(
+                                chunk_parts,
+                                int(chunk_range.get("action_start", 0)),
+                                int(chunk_range.get("action_end", 0)),
+                            )
+                            if not chunk_parts:
+                                continue
+                            chunk_idx = torch.cat(chunk_parts, dim=0)
+                            chunk_key_idx = torch.cat(previous_key_parts + [chunk_idx], dim=0)
+                            chunk_out = flash_attention(
+                                q=q_cat.index_select(1, chunk_idx),
+                                k=k_cat.index_select(1, chunk_key_idx),
+                                v=v_cat.index_select(1, chunk_key_idx),
+                                window_size=self.window_size)
+                            attn_out.index_copy_(1, chunk_idx, chunk_out)
+                            previous_key_parts.append(chunk_idx)
+                            chunk_indices.append(chunk_idx)
+
+                        if chunk_indices:
+                            covered_future_idx = torch.cat(chunk_indices, dim=0)
+                            coverage_matches = (
+                                int(covered_future_idx.numel()) == int(future_idx.numel())
+                                and torch.equal(
+                                    torch.sort(covered_future_idx).values,
+                                    torch.sort(future_idx).values,
+                                )
+                            )
+                            if not coverage_matches:
+                                raise ValueError(
+                                    "Chunk-causal mask did not cover all future tokens: "
+                                    f"covered={covered_future_idx.numel()}, expected={future_idx.numel()}"
+                                )
+                        else:
+                            future_out = flash_attention(
+                                q=q_cat.index_select(1, future_idx),
+                                k=k_cat,
+                                v=v_cat,
+                                window_size=self.window_size)
+                            attn_out.index_copy_(1, future_idx, future_out)
+                    else:
+                        future_out = flash_attention(
+                            q=q_cat.index_select(1, future_idx),
+                            k=k_cat,
+                            v=v_cat,
+                            window_size=self.window_size)
+                        attn_out.index_copy_(1, future_idx, future_out)
+                else:
+                    attn_out = flash_attention(
+                        q=q_cat,
+                        k=k_cat,
+                        v=v_cat,
+                        k_lens=seq_lens,
+                        window_size=self.window_size)
+            elif attn_mask is None:
+                attn_out = flash_attention(
+                    q=q_cat,
+                    k=k_cat,
+                    v=v_cat,
+                    k_lens=seq_lens,
+                    window_size=self.window_size)
+            else:
+                # FlashAttention varlen does not support this extended-horizon
+                # chunk mask directly, so use SDPA for diagnostic mask variants.
+                q_sdpa = q_cat.transpose(1, 2).to(v_cat.dtype)
+                k_sdpa = k_cat.transpose(1, 2).to(v_cat.dtype)
+                v_sdpa = v_cat.transpose(1, 2)
+                attn_out = torch.nn.functional.scaled_dot_product_attention(
+                    q_sdpa,
+                    k_sdpa,
+                    v_sdpa,
+                    attn_mask=attn_mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                ).transpose(1, 2).contiguous()
 
             # Split outputs back to respective modalities
             x_out = attn_out[:, :L_x, :, :]

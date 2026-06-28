@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import cv2
+import json
 from pathlib import Path
 import sys
 import os
@@ -33,6 +34,13 @@ from utils.image_utils import resize_with_padding
 
 logger = logging.getLogger(__name__)
 
+
+def env_flag(value: Optional[str], default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 class MotusPolicy:
     """
     Motus Policy wrapper for RoboTwin evaluation.
@@ -48,6 +56,20 @@ class MotusPolicy:
         # Load configuration
         with open(config_path, 'r') as f:
             self.config_dict = yaml.safe_load(f)
+
+        self.lora_checkpoint_file = self._get_lora_checkpoint_file(self.checkpoint_path)
+        self.lora_checkpoint_config = self._load_lora_checkpoint_config(self.checkpoint_path)
+        lora_cfg = dict(self.config_dict.get('model', {}).get('lora', {}) or {})
+        lora_cfg.update(self.lora_checkpoint_config.get("lora", {}) or {})
+        self.lora_enabled = env_flag(
+            os.environ.get("MOTUS_LORA_FINETUNE"),
+            bool(lora_cfg.get('enabled', self.lora_checkpoint_file is not None)),
+        )
+        self.lora_rank = max(1, int(os.environ.get("MOTUS_LORA_RANK", lora_cfg.get('rank', 8))))
+        self.lora_alpha = float(os.environ.get("MOTUS_LORA_ALPHA", lora_cfg.get('alpha', 16.0)))
+        self.lora_dropout = float(os.environ.get("MOTUS_LORA_DROPOUT", lora_cfg.get('dropout', 0.0)))
+        self.lora_target_linear = env_flag(os.environ.get("MOTUS_LORA_TARGET_LINEAR"), bool(lora_cfg.get('target_linear', True)))
+        self.lora_target_qkv = env_flag(os.environ.get("MOTUS_LORA_TARGET_QKV"), bool(lora_cfg.get('target_qkv', True)))
         
         # Initialize model WITHOUT loading pretrained backbones
         self.model = self._load_model()
@@ -78,15 +100,71 @@ class MotusPolicy:
         self._load_normalization_stats()
         
         # Initialize image saving
-        self.save_images = True
+        self.save_images = env_flag(os.environ.get("MOTUS_SAVE_IMAGES"), True)
+        self.decode_video = not env_flag(os.environ.get("MOTUS_SKIP_VIDEO_DECODE"), False)
         base_log_dir = log_dir or os.environ.get('LOG_DIR') or str(Path(__file__).resolve().parent.parent / "logs")
         task_dir_name = task_name or os.environ.get('TASK_NAME') or "default_task"
         self.save_dir = Path(base_log_dir) / "images" / task_dir_name
-        self.save_dir.mkdir(parents=True, exist_ok=True)
+        if self.save_images:
+            self.save_dir.mkdir(parents=True, exist_ok=True)
         self.episode_count = 0
         self.step_count = 0
 
+        extended_cfg = dict(self.config_dict.get("model", {}).get("extended_chunkwise_finetune", {}) or {})
+        extended_cfg.update(self.lora_checkpoint_config.get("extended_chunkwise_finetune", {}) or {})
+        pipeline_switch_text = str(os.environ.get("MOTUS_PIPELINE_DENOISE", "") or "").strip().lower()
+        pipeline_mode_env = os.environ.get("MOTUS_PIPELINE_DENOISE_MODE", "").strip().lower()
+        extended_horizon_modes = {
+            "extended",
+            "extended_horizon",
+            "extended-horizon",
+            "extended_horizon_pipeline",
+            "extended-horizon-pipeline",
+            "extended_prefix_pipeline",
+            "extended-prefix-pipeline",
+        }
+        self.extended_horizon_enabled = (
+            env_flag(os.environ.get("MOTUS_EXTENDED_HORIZON"), bool(extended_cfg.get("enabled", False)))
+            or env_flag(os.environ.get("MOTUS_EXTENDED_HORIZON_PIPELINE"), False)
+            or pipeline_switch_text in extended_horizon_modes
+            or pipeline_mode_env in extended_horizon_modes
+        )
+        self.pipeline_enabled = self.extended_horizon_enabled
+        self.pipeline_mode = "extended_horizon" if self.extended_horizon_enabled else pipeline_mode_env
+
+        self.extended_horizon_multiplier = max(
+            1,
+            int(os.environ.get("MOTUS_EXTENDED_HORIZON_MULTIPLIER", extended_cfg.get("multiplier", 3))),
+        )
+        self.extended_prefix_mask = env_flag(os.environ.get("MOTUS_EXTENDED_PREFIX_MASK"), True)
+        self.extended_prefix_mask_backend = os.environ.get(
+            "MOTUS_EXTENDED_PREFIX_MASK_BACKEND",
+            "chunk_causal",
+        ).strip().lower()
+        self.exec_actions_override = os.environ.get("MOTUS_EXEC_ACTIONS")
+        self.pipeline_replan_idx = 0
+
         logger.info("Motus Policy initialized successfully")
+
+    @staticmethod
+    def _get_lora_checkpoint_file(path: str) -> Optional[Path]:
+        checkpoint_path = Path(path)
+        if checkpoint_path.is_dir():
+            lora_file = checkpoint_path / "lora_adapters.pt"
+            if lora_file.is_file():
+                return lora_file
+        return None
+
+    @staticmethod
+    def _load_lora_checkpoint_config(path: str) -> Dict[str, Any]:
+        checkpoint_path = Path(path)
+        if not checkpoint_path.is_dir():
+            return {}
+        config_file = checkpoint_path / "config.json"
+        if not config_file.is_file():
+            return {}
+        with config_file.open("r", encoding="utf-8") as f:
+            return json.load(f)
 
     def set_instruction(self, instruction: str):
         """Set the current instruction for the policy."""
@@ -102,12 +180,57 @@ class MotusPolicy:
         # Initialize model from config WITHOUT loading pretrained weights
         model = Motus(config)
         model = model.to(self.device)
+        if self.lora_enabled:
+            logger.info("Registering Action/Understanding LoRA adapters before checkpoint load")
+            model.enable_action_und_lora_finetune(
+                rank=self.lora_rank,
+                alpha=self.lora_alpha,
+                dropout=self.lora_dropout,
+                target_linear=self.lora_target_linear,
+                target_qkv=self.lora_target_qkv,
+            )
         
         # Load checkpoint weights
         try:
-            logger.info(f"Loading checkpoint from {self.checkpoint_path}")
-            model.load_checkpoint(self.checkpoint_path, strict=False)
-            logger.info("Model checkpoint loaded successfully")
+            if self.lora_checkpoint_file is not None:
+                if not self.lora_enabled:
+                    raise ValueError("LoRA-only checkpoint requires LoRA adapters to be enabled")
+                base_checkpoint = os.environ.get("MOTUS_BASE_CHECKPOINT", "").strip()
+                if not base_checkpoint:
+                    base_checkpoint = (
+                        self.lora_checkpoint_config
+                        .get("finetune", {})
+                        .get("checkpoint_path", "")
+                    )
+                if not base_checkpoint:
+                    raise ValueError(
+                        "LoRA-only checkpoint needs MOTUS_BASE_CHECKPOINT or "
+                        "finetune.checkpoint_path in config.json"
+                    )
+
+                logger.info(f"Loading base checkpoint from {base_checkpoint}")
+                model.load_checkpoint(base_checkpoint, strict=False)
+                logger.info("Base checkpoint loaded successfully")
+
+                logger.info(f"Loading LoRA adapters from {self.lora_checkpoint_file}")
+                lora_state = torch.load(str(self.lora_checkpoint_file), map_location="cpu")
+                if isinstance(lora_state, dict) and isinstance(lora_state.get("model"), dict):
+                    lora_state = lora_state["model"]
+                if not isinstance(lora_state, dict):
+                    raise ValueError(f"Unsupported LoRA checkpoint format: {self.lora_checkpoint_file}")
+                missing_keys, unexpected_keys = model.load_state_dict(lora_state, strict=False)
+                logger.info(
+                    "LoRA checkpoint loaded successfully: tensors=%d, missing=%d, unexpected=%d",
+                    len(lora_state),
+                    len(missing_keys),
+                    len(unexpected_keys),
+                )
+                if unexpected_keys:
+                    logger.warning("Unexpected LoRA keys: %s", unexpected_keys[:20])
+            else:
+                logger.info(f"Loading checkpoint from {self.checkpoint_path}")
+                model.load_checkpoint(self.checkpoint_path, strict=False)
+                logger.info("Model checkpoint loaded successfully")
         except Exception as e:
             logger.error(f"Failed to load checkpoint: {e}")
             raise
@@ -166,6 +289,12 @@ class MotusPolicy:
             # Don't load pretrained backbones - will load full model from checkpoint
             load_pretrained_backbones=False,
             training_mode='finetune',
+            lora_enabled=self.lora_enabled,
+            lora_rank=self.lora_rank,
+            lora_alpha=self.lora_alpha,
+            lora_dropout=self.lora_dropout,
+            lora_target_linear=self.lora_target_linear,
+            lora_target_qkv=self.lora_target_qkv,
         )
 
         return config
@@ -230,6 +359,11 @@ class MotusPolicy:
             raise ValueError("No robot state available. Call update_obs first.")
         
         current_frame = self.obs_cache[-1]
+        execute_actions = self._get_execute_actions()
+        configured_steps = int(os.environ.get(
+            "MOTUS_NUM_INFERENCE_STEPS",
+            self.config_dict['model']['inference']['num_inference_timesteps'],
+        ))
 
         # Encode instruction with T5
         scene_prefix = ("The whole scene is in a realistic, industrial art style with three views: "
@@ -249,7 +383,16 @@ class MotusPolicy:
         vlm_inputs = self._preprocess_vlm_messages(instruction, first_frame_pil)
 
         # Run inference
-        num_inference_steps = self.config_dict['model']['inference']['num_inference_timesteps']
+        num_inference_steps = max(1, configured_steps)
+        pipeline_config = {}
+        if self.extended_horizon_enabled:
+            pipeline_config = {
+                "mode": "extended_horizon",
+                "extended_horizon_enabled": True,
+                "extended_horizon_multiplier": self.extended_horizon_multiplier,
+                "extended_prefix_mask": self.extended_prefix_mask,
+                "extended_prefix_mask_backend": self.extended_prefix_mask_backend,
+            }
         with torch.no_grad():
             predicted_frames, predicted_actions = self.model.inference_step(
                 first_frame=current_frame,
@@ -257,10 +400,22 @@ class MotusPolicy:
                 num_inference_steps=num_inference_steps,
                 language_embeddings=t5_list,
                 vlm_inputs=[vlm_inputs],
+                pipeline_config=pipeline_config,
+                decode_video=self.decode_video,
+            )
+
+        if self.extended_horizon_enabled:
+            info = getattr(self.model, "last_pipeline_denoise_info", {})
+            effective_reuse_allowed = bool(info.get("reuse_allowed", False))
+            print(
+                "Extended horizon denoise "
+                f"replan={self.pipeline_replan_idx} reuse={effective_reuse_allowed} "
+                f"info={info}",
+                flush=True,
             )
 
         # Save frame grid
-        if predicted_frames is not None:
+        if self.save_images and predicted_frames is not None:
             if predicted_frames.dim() == 5:
                 if predicted_frames.shape[1] == 3:
                     predicted_frames_viz = predicted_frames.permute(0, 2, 1, 3, 4)
@@ -274,10 +429,22 @@ class MotusPolicy:
                 self.step_count += 1
 
         actions_real = predicted_actions.squeeze(0).cpu().numpy()
-        self.prev_action = actions_real[-1].copy()
-        self.action_cache.extend(actions_real)
+        actions_to_execute = actions_real[:execute_actions]
+        self.prev_action = actions_to_execute[-1].copy()
+        self.action_cache.extend(actions_to_execute)
+        self.pipeline_replan_idx += 1
 
-        return actions_real
+        return actions_to_execute
+
+    def _get_action_chunk_size(self) -> int:
+        common = self.config_dict['common']
+        return int(common.get('action_chunk_size', common['num_video_frames'] * common['video_action_freq_ratio']))
+
+    def _get_execute_actions(self) -> int:
+        action_chunk_size = self._get_action_chunk_size()
+        if self.exec_actions_override is None or not self.exec_actions_override.strip():
+            return action_chunk_size
+        return max(1, min(action_chunk_size, int(self.exec_actions_override)))
 
     def _tensor_to_pil_image(self, tensor_chw: torch.Tensor) -> Image.Image:
         """Convert [C, H, W] tensor to PIL Image."""
@@ -444,6 +611,7 @@ def reset_model(model):
     model.current_state = None
     model.is_first_step = True
     model.prev_action = None
+    model.pipeline_replan_idx = 0
     model.episode_count += 1
     model.step_count = 0
     logger.info(f"Model reset completed for episode {model.episode_count}")

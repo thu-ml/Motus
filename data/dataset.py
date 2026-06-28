@@ -49,6 +49,9 @@ def create_dataset(config: OmegaConf, val: bool = False):
             params['image_aug'] = config.dataset.image_aug and not val  # No aug for validation
         if hasattr(config.dataset, 'randomized_limit_per_task'):
             params['randomized_limit_per_task'] = config.dataset.randomized_limit_per_task
+        extended_chunkwise = getattr(config.model, 'extended_chunkwise_finetune', {})
+        if bool(extended_chunkwise.get('enabled', False)):
+            params['extended_action_multiplier'] = int(extended_chunkwise.get('multiplier', 3))
         
         # Add VLM checkpoint path
         if hasattr(config.model, 'vlm') and hasattr(config.model.vlm, 'checkpoint_path'):
@@ -335,5 +338,18 @@ def collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]
 
     if initial_states is not None:
         result['initial_state'] = initial_states
+
+    if all(('extended_action_sequence' in sample and sample['extended_action_sequence'] is not None) for sample in batch):
+        result['extended_action_sequence'] = torch.stack([sample['extended_action_sequence'] for sample in batch])
+        result['extended_action_indices'] = torch.stack([sample['extended_action_indices'] for sample in batch])
+
+    if all(('condition_frame_idx' in sample and sample['condition_frame_idx'] is not None) for sample in batch):
+        result['condition_frame_idx'] = torch.stack([sample['condition_frame_idx'] for sample in batch])
+
+    if all(('video_indices' in sample and sample['video_indices'] is not None) for sample in batch):
+        result['video_indices'] = torch.stack([sample['video_indices'] for sample in batch])
+
+    if all(('action_indices' in sample and sample['action_indices'] is not None) for sample in batch):
+        result['action_indices'] = torch.stack([sample['action_indices'] for sample in batch])
     
     return result

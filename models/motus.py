@@ -8,6 +8,7 @@ import torch
 import logging
 import torch.nn as nn
 from pathlib import Path
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Tuple
 
@@ -19,8 +20,9 @@ from utils.common import get_t_distribution
 from wan.modules.model import sinusoidal_embedding_1d
 from transformers import Qwen3VLForConditionalGeneration, AutoConfig
 from .wan_model import WanVideoModel
-from .action_expert import ActionExpert, ActionExpertConfig
+from .action_expert import ActionExpert, ActionExpertConfig, get_1d_sincos_pos_embed_from_grid
 from .und_expert import UndExpert, UndExpertConfig
+from .lora import add_lora_to_linear_modules, mark_only_lora_as_trainable
 # Add Flow-Matching schedulers
 from wan.utils.fm import FlowMatchScheduler
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
@@ -79,6 +81,23 @@ class MotusConfig:
     # Control whether to load pretrained WAN/VLM backbones.
     # None = default behavior (load), False = skip loading (init from config only)
     load_pretrained_backbones: Optional[bool] = None
+
+    # LoRA finetuning settings for extended chunk-wise adaptation.
+    lora_enabled: bool = False
+    lora_rank: int = 8
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.0
+    lora_target_linear: bool = True
+    lora_target_qkv: bool = True
+
+    # Streaming-Diffusion-Policy style extended action finetuning.
+    extended_chunkwise_enabled: bool = False
+    extended_chunkwise_multiplier: int = 3
+    extended_chunkwise_chunk_weight_0: float = 1.0
+    extended_chunkwise_chunk_weight_1: float = 0.7
+    extended_chunkwise_chunk_weight_2: float = 0.5
+    extended_chunkwise_constant_weight: float = 0.2
+    extended_chunkwise_chunkwise_weight: float = 0.8
 
     def __post_init__(self):
         """Calculate derived parameters."""
@@ -197,10 +216,16 @@ class VideoModule(nn.Module):
         with torch.amp.autocast('cuda', dtype=torch.float32):
             return video_tokens + ffn_out * v_mod[5].squeeze(2)
 
-    def apply_output_head(self, video_tokens: torch.Tensor, video_time_emb: torch.Tensor) -> torch.Tensor:
+    def apply_output_head(
+        self,
+        video_tokens: torch.Tensor,
+        video_time_emb: torch.Tensor,
+        grid_sizes: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Apply WAN's head + unpatchify for final video output."""
+        grid_sizes = self.grid_sizes if grid_sizes is None else grid_sizes
         x = self.video_model.wan_model.head(video_tokens, video_time_emb)
-        x = self.video_model.wan_model.unpatchify(x, self.grid_sizes)
+        x = self.video_model.wan_model.unpatchify(x, grid_sizes)
         return torch.stack([u.float() for u in x], dim=0)
 
     def process_joint_attention(
@@ -213,6 +238,8 @@ class VideoModule(nn.Module):
         action_block: nn.Module,
         und_tokens: torch.Tensor,
         und_block: nn.Module,
+        grid_sizes: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Trimodal joint self-attention: WAN + Action + Understanding via WAN self-attn (MoT)."""
         wan_layer = self.video_model.wan_model.blocks[layer_idx]
@@ -232,7 +259,10 @@ class VideoModule(nn.Module):
         d = C // n
 
         # Action heads for WAN space (1024 -> 24*128)
-        a_qkv = torch.einsum("BTD,KNDE->KBTNE", norm_action, action_block.wan_action_qkv)
+        if hasattr(action_block, "project_wan_action_qkv"):
+            a_qkv = action_block.project_wan_action_qkv(norm_action)
+        else:
+            a_qkv = torch.einsum("BTD,KNDE->KBTNE", norm_action, action_block.wan_action_qkv)
         a_q_h, a_k_h, a_v_h = a_qkv[0], a_qkv[1], a_qkv[2]
         a_q = action_block.wan_action_norm_q(a_q_h.flatten(-2)).view(B, L_a, n, d)
         a_k = action_block.wan_action_norm_k(a_k_h.flatten(-2)).view(B, L_a, n, d)
@@ -243,7 +273,10 @@ class VideoModule(nn.Module):
         L_u = norm_und.shape[1]
         
         # Understanding Expert heads for WAN space (2048 -> 24*128)
-        u_qkv = torch.einsum("BTD,KNDE->KBTNE", norm_und, und_block.wan_und_qkv)
+        if hasattr(und_block, "project_wan_und_qkv"):
+            u_qkv = und_block.project_wan_und_qkv(norm_und)
+        else:
+            u_qkv = torch.einsum("BTD,KNDE->KBTNE", norm_und, und_block.wan_und_qkv)
         u_q_h, u_k_h, u_v_h = u_qkv[0], u_qkv[1], u_qkv[2]
         u_q = und_block.wan_und_norm_q(u_q_h.flatten(-2)).view(B, L_u, n, d)
         u_k = und_block.wan_und_norm_k(u_k_h.flatten(-2)).view(B, L_u, n, d)
@@ -251,15 +284,17 @@ class VideoModule(nn.Module):
 
         # Meta info for WAN attention
         seq_lens = torch.full((B,), L_v + L_a + L_u, dtype=torch.long, device=self.device)
+        grid_sizes = self.grid_sizes if grid_sizes is None else grid_sizes
         freqs = self.video_model.wan_model.freqs
         if freqs.device != self.device:
             freqs = freqs.to(self.device)
 
         # Call WAN self-attn with trimodal MoT
         y, action_out_h, und_out_h = wan_layer.self_attn(
-            norm_video, seq_lens, self.grid_sizes, freqs,
+            norm_video, seq_lens, grid_sizes, freqs,
             action_q=a_q, action_k=a_k, action_v=a_v,
-            und_q=u_q, und_k=u_k, und_v=u_v
+            und_q=u_q, und_k=u_k, und_v=u_v,
+            attn_mask=attn_mask,
         )
         
         # Project Understanding Expert output
@@ -689,6 +724,98 @@ class Motus(nn.Module):
         logger.info(f"  VLM (frozen): {vlm_params / 1e9:.2f}B")
         logger.info(f"  Und Expert: {und_params / 1e6:.1f}M")
 
+    def enable_action_und_lora_finetune(
+        self,
+        rank: int = 8,
+        alpha: float = 16.0,
+        dropout: float = 0.0,
+        target_linear: bool = True,
+        target_qkv: bool = True,
+    ) -> Dict[str, Any]:
+        """Freeze the model and train only Action/Understanding Expert LoRA adapters."""
+        for param in self.parameters():
+            param.requires_grad = False
+
+        stats: Dict[str, Any] = {
+            "rank": int(rank),
+            "alpha": float(alpha),
+            "dropout": float(dropout),
+            "target_linear": bool(target_linear),
+            "target_qkv": bool(target_qkv),
+        }
+
+        if target_linear:
+            stats["action_linear"] = add_lora_to_linear_modules(
+                self.action_expert, rank=rank, alpha=alpha, dropout=dropout
+            )
+            stats["und_linear"] = add_lora_to_linear_modules(
+                self.und_expert, rank=rank, alpha=alpha, dropout=dropout
+            )
+
+        qkv_params = 0
+        if target_qkv:
+            for block in self.action_expert.blocks:
+                qkv_params += block.enable_wan_action_qkv_lora(rank=rank, alpha=alpha, dropout=dropout)
+            for block in self.und_expert.blocks:
+                qkv_params += block.enable_wan_und_qkv_lora(rank=rank, alpha=alpha, dropout=dropout)
+        stats["qkv_lora_params"] = qkv_params
+        stats.update(mark_only_lora_as_trainable(self))
+        stats["frozen_unused_final_und_lora"] = self._freeze_unused_final_und_lora()
+        stats["trainable_lora_params"] = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        stats["trainable_lora_tensors"] = sum(1 for p in self.parameters() if p.requires_grad)
+        self.lora_finetune_info = stats
+        logger.info("Enabled Action/Understanding LoRA finetuning: %s", stats)
+        return stats
+
+    def _freeze_unused_final_und_lora(self) -> Dict[str, int]:
+        """Freeze LoRA params that cannot affect action/video losses."""
+        if not getattr(self.und_expert, "blocks", None):
+            return {"tensors": 0, "params": 0}
+
+        frozen_tensors = 0
+        frozen_params = 0
+        final_block = self.und_expert.blocks[-1]
+        for module_name in ("wan_und_o", "ffn"):
+            module = getattr(final_block, module_name, None)
+            if module is None:
+                continue
+            for submodule in module.modules():
+                for param_name in ("lora_A", "lora_B"):
+                    param = getattr(submodule, param_name, None)
+                    if isinstance(param, nn.Parameter) and param.requires_grad:
+                        param.requires_grad = False
+                        frozen_tensors += 1
+                        frozen_params += param.numel()
+        return {"tensors": frozen_tensors, "params": frozen_params}
+
+    @contextmanager
+    def disable_lora_adapters(self):
+        """Temporarily run this model as the frozen base model."""
+        saved_states = []
+        for module in self.modules():
+            if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+                saved_states.append((module, "lora_disabled", getattr(module, "lora_disabled", False)))
+                module.lora_disabled = True
+            if hasattr(module, "wan_action_qkv_lora_A") and hasattr(module, "wan_action_qkv_lora_B"):
+                saved_states.append((
+                    module,
+                    "wan_action_qkv_lora_disabled",
+                    getattr(module, "wan_action_qkv_lora_disabled", False),
+                ))
+                module.wan_action_qkv_lora_disabled = True
+            if hasattr(module, "wan_und_qkv_lora_A") and hasattr(module, "wan_und_qkv_lora_B"):
+                saved_states.append((
+                    module,
+                    "wan_und_qkv_lora_disabled",
+                    getattr(module, "wan_und_qkv_lora_disabled", False),
+                ))
+                module.wan_und_qkv_lora_disabled = True
+        try:
+            yield
+        finally:
+            for module, attr, value in saved_states:
+                setattr(module, attr, value)
+
     def load_checkpoint(self, path: str, strict: bool = True) -> Dict:
         """Load model checkpoint."""
         # Handle directory path
@@ -902,6 +1029,366 @@ class Motus(nn.Module):
                 'video_timestep_mean': sigma.float().mean().item(),
                 'action_timestep_mean': sigma_action.float().mean().item(),
             }
+
+    def _extended_action_pos_embedding(self, seq_len: int) -> torch.Tensor:
+        dim = self.action_expert.config.dim
+        positions = torch.arange(seq_len)
+        return get_1d_sincos_pos_embed_from_grid(dim, positions).to(
+            device=self.device,
+            dtype=self.dtype,
+        ).unsqueeze(0)
+
+    def _encode_extended_action_tokens(
+        self,
+        state: torch.Tensor,
+        action_latent: torch.Tensor,
+        base_action_len: int,
+    ) -> Tuple[torch.Tensor, Dict[str, int]]:
+        B, extended_action_len, _ = action_latent.shape
+        num_registers = int(self.action_expert.config.num_registers)
+        registers = (
+            self.action_expert.registers.expand(B, -1, -1)
+            if num_registers > 0 and self.action_expert.registers is not None
+            else None
+        )
+        future_action_len = max(0, extended_action_len - base_action_len)
+        encoder = self.action_expert.input_encoder
+
+        if self.config.training_mode == 'pretrain':
+            prefix_tokens = encoder.action_encoder(action_latent[:, :base_action_len])
+            parts = [prefix_tokens]
+            prefix_action_start = 0
+            prefix_action_end = base_action_len
+        else:
+            state_tokens = state.unsqueeze(1).to(self.dtype)
+            state_encoded = encoder.state_encoder(state_tokens)
+            prefix_tokens = encoder.action_encoder(action_latent[:, :base_action_len])
+            parts = [state_encoded, prefix_tokens]
+            prefix_action_start = 1
+            prefix_action_end = 1 + base_action_len
+
+        register_start = sum(part.shape[1] for part in parts)
+        if registers is not None:
+            parts.append(registers)
+        register_end = sum(part.shape[1] for part in parts)
+
+        future_action_start = register_end
+        if future_action_len > 0:
+            future_tokens = encoder.action_encoder(action_latent[:, base_action_len:])
+            parts.append(future_tokens)
+        future_action_end = sum(part.shape[1] for part in parts)
+
+        action_tokens = torch.cat(parts, dim=1)
+        action_tokens = action_tokens + self._extended_action_pos_embedding(action_tokens.shape[1])
+        return action_tokens, {
+            "prefix_action_start": prefix_action_start,
+            "prefix_action_end": prefix_action_end,
+            "register_start": register_start,
+            "register_end": register_end,
+            "future_action_start": future_action_start,
+            "future_action_end": future_action_end,
+            "extended_action_len": extended_action_len,
+            "base_action_len": base_action_len,
+        }
+
+    def _decode_extended_action_velocity(
+        self,
+        action_tokens: torch.Tensor,
+        action_head_time_emb: torch.Tensor,
+        layout: Dict[str, int],
+    ) -> torch.Tensor:
+        action_pred_full = self.action_expert.decoder(action_tokens, action_head_time_emb)
+        B = action_pred_full.shape[0]
+        action_velocity = action_pred_full.new_empty(
+            B,
+            layout["extended_action_len"],
+            self.config.action_dim,
+        )
+        base_len = layout["base_action_len"]
+        action_velocity[:, :base_len] = action_pred_full[
+            :, layout["prefix_action_start"]:layout["prefix_action_end"], :
+        ]
+        future_len = layout["extended_action_len"] - base_len
+        if future_len > 0:
+            action_velocity[:, base_len:] = action_pred_full[
+                :, layout["future_action_start"]:layout["future_action_end"], :
+            ]
+        return action_velocity
+
+    def _extended_action_token_timesteps(
+        self,
+        chunk_timesteps: torch.Tensor,
+        layout: Dict[str, int],
+    ) -> torch.Tensor:
+        B, chunks = chunk_timesteps.shape
+        base_len = layout["base_action_len"]
+        avg_t = chunk_timesteps.mean(dim=1, keepdim=True)
+        parts: List[torch.Tensor] = []
+        if self.config.training_mode != 'pretrain':
+            parts.append(avg_t)
+        parts.append(chunk_timesteps[:, 0:1].expand(B, base_len))
+        register_len = layout["register_end"] - layout["register_start"]
+        if register_len > 0:
+            parts.append(avg_t.expand(B, register_len))
+        if chunks > 1:
+            parts.append(
+                chunk_timesteps[:, 1:]
+                .unsqueeze(-1)
+                .expand(B, chunks - 1, base_len)
+                .reshape(B, (chunks - 1) * base_len)
+            )
+        return torch.cat(parts, dim=1)
+
+    def _build_action_chunk_causal_attn_mask(
+        self,
+        video_token_len: int,
+        action_token_len: int,
+        und_token_len: int,
+        layout: Dict[str, int],
+        multiplier: int,
+    ) -> Optional[Dict[str, Any]]:
+        if multiplier <= 1:
+            return None
+        base_len = int(layout["base_action_len"])
+        future_action_abs_start = int(video_token_len + layout["future_action_start"])
+        future_action_abs_end = int(video_token_len + layout["future_action_end"])
+        future_chunk_ranges = []
+        for future_chunk_idx in range(multiplier - 1):
+            action_start = future_action_abs_start + future_chunk_idx * base_len
+            action_end = min(action_start + base_len, future_action_abs_end)
+            future_chunk_ranges.append(
+                {
+                    "chunk_index": int(future_chunk_idx + 1),
+                    "video_start": int(video_token_len),
+                    "video_end": int(video_token_len),
+                    "action_start": int(action_start),
+                    "action_end": int(action_end),
+                }
+            )
+        return {
+            "type": "extended_chunk_causal",
+            "video_token_len": int(video_token_len),
+            "action_token_len": int(action_token_len),
+            "und_token_len": int(und_token_len),
+            "prefix_video_token_len": int(video_token_len),
+            "future_action_start": int(layout["future_action_start"]),
+            "future_action_end": int(layout["future_action_end"]),
+            "future_chunk_ranges": future_chunk_ranges,
+        }
+
+    def _sample_extended_chunk_timesteps(
+        self,
+        B: int,
+        multiplier: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, str]:
+        scheduler = self.fm_train_scheduler_action
+        N = int(scheduler.num_train_timesteps)
+        constant_weight = float(self.config.extended_chunkwise_constant_weight)
+        chunkwise_weight = float(self.config.extended_chunkwise_chunkwise_weight)
+        total_weight = max(constant_weight + chunkwise_weight, 1e-6)
+        use_chunkwise = torch.rand((), device=self.device).item() < (chunkwise_weight / total_weight)
+
+        if not use_chunkwise:
+            timestep_ids = torch.randint(0, N, (B, 1), device=self.device).expand(B, multiplier)
+            regime = "constant"
+        else:
+            chunk_ids = torch.arange(multiplier, device=self.device).unsqueeze(0).expand(B, -1)
+            upper_limit = max(1, N // max(1, multiplier))
+            offset = torch.randint(0, upper_limit, (B, 1), device=self.device).expand(B, multiplier)
+            levels = torch.floor((N * (chunk_ids + 1)) / multiplier).long() - 1 - offset
+            levels = levels.clamp(0, N - 1)
+            timestep_ids = (N - 1 - levels).clamp(0, N - 1)
+            regime = "chunkwise"
+
+        chunk_timesteps = scheduler.timesteps.to(device=self.device, dtype=self.dtype)[timestep_ids]
+        chunk_sigmas = scheduler.sigmas.to(device=self.device, dtype=self.dtype)[timestep_ids]
+        return chunk_timesteps, chunk_sigmas, regime
+
+    def _extended_chunk_loss(
+        self,
+        action_velocity: torch.Tensor,
+        action_target: torch.Tensor,
+        multiplier: int,
+        base_len: int,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        weights = torch.tensor(
+            [
+                float(self.config.extended_chunkwise_chunk_weight_0),
+                float(self.config.extended_chunkwise_chunk_weight_1),
+                float(self.config.extended_chunkwise_chunk_weight_2),
+            ],
+            device=action_velocity.device,
+            dtype=action_velocity.dtype,
+        )
+        if multiplier > weights.numel():
+            tail = weights[-1].expand(multiplier - weights.numel())
+            weights = torch.cat([weights, tail], dim=0)
+        weights = weights[:multiplier]
+        per_token_mse = (action_velocity - action_target).pow(2).mean(dim=-1)
+        chunk_losses = []
+        for chunk_idx in range(multiplier):
+            start = chunk_idx * base_len
+            end = start + base_len
+            chunk_losses.append(per_token_mse[:, start:end].mean())
+        chunk_loss_tensor = torch.stack(chunk_losses)
+        action_loss = (chunk_loss_tensor * weights).sum() / weights.sum().clamp_min(1e-6)
+        metrics = {
+            f"action_loss_chunk{idx}": chunk_loss_tensor[idx]
+            for idx in range(multiplier)
+        }
+        return action_loss, metrics
+
+    def extended_chunkwise_training_step(
+        self,
+        first_frame: torch.Tensor,
+        video_frames: torch.Tensor,
+        state: torch.Tensor,
+        actions: torch.Tensor,
+        language_embeddings: Optional[List[torch.Tensor]] = None,
+        vlm_inputs: Optional[List] = None,
+        return_dict: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        B = video_frames.shape[0]
+        base_len = int(self.config.action_chunk_size)
+        extended_len = actions.shape[1]
+        if extended_len % base_len != 0:
+            raise ValueError(f"Extended actions length {extended_len} must be divisible by base length {base_len}")
+        multiplier = extended_len // base_len
+        if multiplier < 2:
+            raise ValueError("Extended chunk-wise finetuning requires at least two action chunks")
+
+        first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)
+        video_normalized = (video_frames * 2.0 - 1.0).permute(0, 2, 1, 3, 4)
+        full_video = torch.cat([first_frame_norm, video_normalized], dim=2)
+        with torch.no_grad():
+            clean_full_latent = self.video_model.encode_video(full_video.to(self.dtype))
+            condition_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))
+
+        timestep_id = torch.randint(0, self.fm_train_scheduler.num_train_timesteps, (B,))
+        video_t_embed = self.fm_train_scheduler.timesteps[timestep_id].to(dtype=self.dtype, device=self.device)
+        sigma = self.fm_train_scheduler.sigmas[timestep_id].to(dtype=self.dtype, device=self.device).view(B, 1, 1, 1, 1)
+        video_noise = torch.randn_like(clean_full_latent, dtype=self.dtype)
+        noisy_video_latent = clean_full_latent * (1 - sigma) + video_noise * sigma
+        noisy_video_latent[:, :, 0:1] = condition_frame_latent
+        video_target = video_noise - clean_full_latent
+        video_target[:, :, 0:1] = 0
+        video_tokens = self.video_module.prepare_input(noisy_video_latent.to(self.dtype))
+
+        chunk_timesteps, chunk_sigmas, noise_regime = self._sample_extended_chunk_timesteps(B, multiplier)
+        action_noise = torch.randn_like(actions, dtype=self.dtype)
+        sigma_action = (
+            chunk_sigmas.unsqueeze(-1)
+            .expand(B, multiplier, base_len)
+            .reshape(B, extended_len)
+            .unsqueeze(-1)
+        )
+        noisy_actions = actions * (1 - sigma_action) + action_noise * sigma_action
+        action_target = action_noise - actions
+
+        action_tokens, action_layout = self._encode_extended_action_tokens(
+            state=state,
+            action_latent=noisy_actions,
+            base_action_len=base_len,
+        )
+        und_tokens = self.und_module.extract_und_features(vlm_inputs)
+        attn_mask = self._build_action_chunk_causal_attn_mask(
+            video_token_len=video_tokens.shape[1],
+            action_token_len=action_tokens.shape[1],
+            und_token_len=und_tokens.shape[1],
+            layout=action_layout,
+            multiplier=multiplier,
+        )
+
+        action_t_embed = self._extended_action_token_timesteps(chunk_timesteps, action_layout)
+        video_head_time_emb, video_adaln_params = self.video_module.get_time_embedding(video_t_embed, video_tokens.shape[1])
+        action_head_time_emb, action_adaln_params = self.action_module.get_time_embedding(action_t_embed, action_tokens.shape[1])
+        processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
+
+        with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
+            for layer_idx in range(self.config.num_layers):
+                video_adaln_modulation = self.video_module.compute_adaln_modulation(video_adaln_params, layer_idx)
+                action_adaln_modulation = self.action_module.compute_adaln_modulation(action_adaln_params, layer_idx)
+                video_tokens, action_tokens, und_tokens = self.video_module.process_joint_attention(
+                    video_tokens,
+                    action_tokens,
+                    video_adaln_modulation,
+                    action_adaln_modulation,
+                    layer_idx,
+                    self.action_expert.blocks[layer_idx],
+                    und_tokens,
+                    self.und_expert.blocks[layer_idx],
+                    attn_mask=attn_mask,
+                )
+                video_tokens = self.video_module.process_cross_attention(video_tokens, video_adaln_params, layer_idx, processed_t5_context)
+                video_tokens = self.video_module.process_ffn(video_tokens, video_adaln_modulation, layer_idx)
+                action_tokens = self.action_module.process_ffn(action_tokens, action_adaln_modulation, layer_idx)
+                und_tokens = self.und_module.process_ffn(und_tokens, layer_idx)
+
+            video_pred = self.video_module.apply_output_head(video_tokens, video_head_time_emb)
+            action_velocity = self._decode_extended_action_velocity(action_tokens, action_head_time_emb, action_layout)
+
+            video_pred_masked = video_pred.clone()
+            video_pred_masked[:, :, 0:1] = 0
+            video_loss = torch.nn.functional.mse_loss(video_pred_masked, video_target, reduction='mean')
+            action_loss, chunk_metrics = self._extended_chunk_loss(
+                action_velocity,
+                action_target,
+                multiplier=multiplier,
+                base_len=base_len,
+            )
+
+        total_loss = (
+            self.config.video_loss_weight * video_loss +
+            self.config.action_loss_weight * action_loss
+        )
+
+        if return_dict:
+            return {
+                'total_loss': total_loss,
+                'video_loss': video_loss,
+                'action_loss': action_loss,
+                'extended_action_loss': action_loss,
+                'extended_multiplier': torch.tensor(float(multiplier), device=self.device),
+                'action_noise_regime_chunkwise': torch.tensor(float(noise_regime == "chunkwise"), device=self.device),
+                'video_timestep_mean': sigma.float().mean().item(),
+                'action_timestep_mean': chunk_sigmas.float().mean().item(),
+                **chunk_metrics,
+            }
+
+    def forward(
+        self,
+        *,
+        first_frame: torch.Tensor,
+        video_frames: Optional[torch.Tensor] = None,
+        state: Optional[torch.Tensor] = None,
+        actions: Optional[torch.Tensor] = None,
+        language_embeddings: Optional[Any] = None,
+        vlm_inputs: Optional[Any] = None,
+        extended_chunkwise: bool = False,
+        return_dict: bool = True,
+        **kwargs,
+    ) -> Dict[str, torch.Tensor]:
+        if video_frames is None or actions is None:
+            raise ValueError("Motus training requires video_frames and actions")
+        if extended_chunkwise:
+            return self.extended_chunkwise_training_step(
+                first_frame=first_frame,
+                video_frames=video_frames,
+                state=state,
+                actions=actions,
+                language_embeddings=language_embeddings,
+                vlm_inputs=vlm_inputs,
+                return_dict=return_dict,
+            )
+        return self.training_step(
+            first_frame=first_frame,
+            video_frames=video_frames,
+            state=state,
+            actions=actions,
+            language_embeddings=language_embeddings,
+            vlm_inputs=vlm_inputs,
+            return_dict=return_dict,
+        )
 
     def inference_step(
         self,

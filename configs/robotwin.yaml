@@ -88,6 +88,26 @@ model:
   loss_weights:
     video_loss_weight: 1.0       # Weight for video reconstruction loss
     action_loss_weight: 1.0     # Weight for action prediction loss
+
+  # Pipeline finetuning adapters. When enabled, the trainer freezes the base
+  # model and trains only LoRA weights inside Action Expert and Understanding Expert.
+  lora:
+    enabled: false
+    rank: 8
+    alpha: 16.0
+    dropout: 0.0
+    target_linear: true
+    target_qkv: true
+
+  # SDP/TEDi-style training for extended action chunks. When enabled, the
+  # dataset returns multiplier * action_chunk_size actions and the action branch
+  # is trained with per-chunk diffusion timesteps.
+  extended_chunkwise_finetune:
+    enabled: false
+    multiplier: 3
+    temporally_constant_weight: 0.2
+    chunk_wise_weight: 0.8
+    chunk_loss_weights: [1.0, 0.7, 0.5]
     
   # EMA settings (not used currently)
   ema:
@@ -161,3 +181,4 @@ resume:
 # Finetune settings 
 finetune:
   checkpoint_path: null  # (directory containing mp_rank_00_model_states.pt)
+  load_method: "pretrain_partial"  # "pretrain_partial" for stage transfer, "full" for task checkpoints

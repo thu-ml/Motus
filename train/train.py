@@ -20,7 +20,10 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ModuleNotFoundError:
+    SummaryWriter = None
 import wandb
 from accelerate import Accelerator
 from accelerate.utils import DeepSpeedPlugin, ProjectConfiguration
@@ -37,6 +40,61 @@ from utils.scheduler import create_scheduler
 from sample import evaluate_model, log_evaluation_metrics
 
 logger = logging.getLogger(__name__)
+
+
+def move_nested_to_device(value: Any, device: torch.device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {k: move_nested_to_device(v, device) for k, v in value.items()}
+    if isinstance(value, list):
+        return [move_nested_to_device(v, device) for v in value]
+    if isinstance(value, tuple):
+        return tuple(move_nested_to_device(v, device) for v in value)
+    return value
+
+
+def _is_lora_key(name: str) -> bool:
+    return "lora_A" in name or "lora_B" in name
+
+
+def collect_lora_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    try:
+        named_params = model.named_parameters(remove_duplicate=True)
+    except TypeError:
+        named_params = model.named_parameters()
+
+    lora_state = {}
+    seen = set()
+    for name, param in named_params:
+        if not _is_lora_key(name):
+            continue
+        key = (param.data_ptr(), tuple(param.shape))
+        if key in seen:
+            continue
+        seen.add(key)
+        lora_state[name] = param.detach().cpu()
+    return lora_state
+
+
+def get_lora_save_config(config: Optional[Any]) -> Dict[str, Any]:
+    if config is None:
+        return {}
+    try:
+        cfg_dict = OmegaConf.to_container(config, resolve=True)
+    except Exception:
+        return {}
+    model_cfg = cfg_dict.get("model", {})
+    return {
+        "common": cfg_dict.get("common", {}),
+        "action_expert": model_cfg.get("action_expert", {}),
+        "und_expert": model_cfg.get("und_expert", {}),
+        "lora": model_cfg.get("lora", {}),
+        "extended_chunkwise_finetune": model_cfg.get("extended_chunkwise_finetune", {}),
+        "dataset": cfg_dict.get("dataset", {}),
+        "finetune": cfg_dict.get("finetune", {}),
+    }
+
 
 def setup_logging(rank: int = 0, log_level: str = "INFO"):
     """Setup logging configuration."""
@@ -115,7 +173,7 @@ class UniDiffuserTrainer:
         save_interval: int = 1000,
         val_interval: int = 1000,
         report_to: str = "wandb",
-        tb_writer: Optional[SummaryWriter] = None,
+        tb_writer: Optional[Any] = None,
         accelerator: Optional[Any] = None,
         config: Optional[Any] = None,
     ):
@@ -152,7 +210,24 @@ class UniDiffuserTrainer:
     def save_checkpoint(self, suffix: str = ""):
         """Save complete training state using accelerator."""
         checkpoint_dir = self.checkpoint_dir / f"checkpoint_step_{self.global_step}{suffix}"
-        
+
+        save_lora_only = False
+        try:
+            save_lora_only = bool(getattr(self.config.system, "save_lora_only", False))
+        except Exception:
+            save_lora_only = False
+
+        if save_lora_only:
+            if self.rank == 0:
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                unwrapped_model = self.accelerator.unwrap_model(self.model) if self.accelerator is not None else self.model
+                lora_state = collect_lora_state_dict(unwrapped_model)
+                torch.save(lora_state, checkpoint_dir / "lora_adapters.pt")
+                with open(checkpoint_dir / "config.json", "w") as f:
+                    json.dump(get_lora_save_config(self.config), f, indent=2)
+                logger.info(f"LoRA checkpoint saved to {checkpoint_dir} ({len(lora_state)} tensors)")
+            return
+
         # Use accelerator to save complete training state
         # This saves model, optimizer, scheduler, dataloader, and RNG states
         self.accelerator.save_state(str(checkpoint_dir))
@@ -170,6 +245,8 @@ class UniDiffuserTrainer:
                 "und_expert": model.get("und_expert", {}),
                 "time_distribution": model.get("time_distribution", {}),
                 "ema": model.get("ema", {}),
+                "lora": model.get("lora", {}),
+                "extended_chunkwise_finetune": model.get("extended_chunkwise_finetune", {}),
             }
             import json as _json
             with open(checkpoint_dir / "config.json", "w") as f:
@@ -284,22 +361,37 @@ class UniDiffuserTrainer:
         # Handle VLM inputs - it's a Dict[str, Tensor] from collate_fn
         vlm_inputs = batch['vlm_inputs']
         if vlm_inputs is not None:
-            # Move all tensors in the VLM inputs dict to device
-            vlm_inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                         for k, v in vlm_inputs.items()}
+            vlm_inputs = move_nested_to_device(vlm_inputs, self.device)
         
-        # Forward pass through UniDiffuser
-        # Handle DDP wrapper
-        model = self.model.module if hasattr(self.model, 'module') else self.model
-        loss_dict = model.training_step(
-            first_frame=first_frame,
-            video_frames=video_frames,
-            state=state,
-            actions=actions,
-            language_embeddings=language_embeddings,  # For WAN cross attention
-            vlm_inputs=vlm_inputs,  # Complete VLM inputs from dataset
-            return_dict=True
-        )
+        extended_cfg = getattr(getattr(self.config, 'model', {}), 'extended_chunkwise_finetune', {})
+        use_extended_chunkwise = bool(extended_cfg.get('enabled', False))
+        if use_extended_chunkwise:
+            if "extended_action_sequence" not in batch or batch["extended_action_sequence"] is None:
+                raise ValueError(
+                    "extended_chunkwise_finetune is enabled but the batch does not contain "
+                    "extended_action_sequence. Check dataset horizon and collate settings."
+                )
+            extended_actions = batch["extended_action_sequence"].to(self.device, dtype=self.dtype)
+            loss_dict = self.model(
+                first_frame=first_frame,
+                video_frames=video_frames,
+                state=state,
+                actions=extended_actions,
+                language_embeddings=language_embeddings,
+                vlm_inputs=vlm_inputs,
+                extended_chunkwise=True,
+                return_dict=True,
+            )
+        else:
+            loss_dict = self.model(
+                first_frame=first_frame,
+                video_frames=video_frames,
+                state=state,
+                actions=actions,
+                language_embeddings=language_embeddings,  # For WAN cross attention
+                vlm_inputs=vlm_inputs,  # Complete VLM inputs from dataset
+                return_dict=True
+            )
         
         total_loss = loss_dict['total_loss']
         
@@ -383,10 +475,20 @@ class UniDiffuserTrainer:
                 lr_main = lrs[0] if len(lrs) > 0 else 0.0
                 lr_wan = lrs[1] if len(lrs) > 1 else lr_main
                 
+                video_metric = metrics.get('video_loss', metrics.get('video_distill_loss', 0.0))
+                action_metric = metrics.get('action_loss', metrics.get('action_distill_loss', 0.0))
+                extra_metrics = []
+                if 'velocity_distill_loss' in metrics:
+                    extra_metrics.append(f"Velocity: {metrics['velocity_distill_loss']:.4f}")
+                if 'intermediate_distill_loss' in metrics:
+                    extra_metrics.append(f"Intermediate: {metrics['intermediate_distill_loss']:.4f}")
+                if 'direct_preservation_loss' in metrics:
+                    extra_metrics.append(f"Direct: {metrics['direct_preservation_loss']:.4f}")
+                extra_metric_str = f", {'; '.join(extra_metrics)}" if extra_metrics else ""
                 log_str = (
                     f"Step {self.global_step}/{max_steps}, "
                     f"Loss: {metrics['total_loss']:.4f} "
-                    f"(Video: {metrics['video_loss']:.4f}, Action: {metrics['action_loss']:.4f}), "
+                    f"(Video: {video_metric:.4f}, Action: {action_metric:.4f}{extra_metric_str}), "
                     f"LR(main/wan): {lr_main:.2e}/{lr_wan:.2e}, Time: {step_time:.2f}s"
                 )
                 logger.info(log_str)
@@ -437,9 +539,25 @@ class UniDiffuserTrainer:
             logger.info(f"UniDiffuser training completed in {total_time:.2f}s ({self.global_step} steps)")
             self.save_checkpoint()
 
-def create_model_and_optimizer(config: OmegaConf) -> tuple:
-    """Create UniDiffuser model and optimizer from config."""
-    # Create Motus config
+def _get_lora_config(config: OmegaConf):
+    if hasattr(config.model, "lora"):
+        return config.model.lora
+    return {}
+
+
+def _get_extended_chunkwise_config(config: OmegaConf):
+    if hasattr(config.model, "extended_chunkwise_finetune"):
+        return config.model.extended_chunkwise_finetune
+    return {}
+
+
+def create_model(config: OmegaConf) -> Motus:
+    """Create UniDiffuser model from config."""
+    lora_cfg = _get_lora_config(config)
+    extended_cfg = _get_extended_chunkwise_config(config)
+    chunk_loss_weights = list(extended_cfg.get('chunk_loss_weights', [1.0, 0.7, 0.5]))
+    while len(chunk_loss_weights) < 3:
+        chunk_loss_weights.append(chunk_loss_weights[-1] if chunk_loss_weights else 1.0)
     model_config = MotusConfig(
         wan_checkpoint_path=config.model.wan.checkpoint_path,
         vae_path=config.model.wan.vae_path,
@@ -469,11 +587,38 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple:
         action_loss_weight=config.model.loss_weights.action_loss_weight,
         training_mode=getattr(config, 'training_mode', 'finetune'),
         load_pretrained_backbones=getattr(config.model, 'load_pretrained_backbones', None),
+        lora_enabled=bool(lora_cfg.get('enabled', False)),
+        lora_rank=int(lora_cfg.get('rank', 8)),
+        lora_alpha=float(lora_cfg.get('alpha', 16.0)),
+        lora_dropout=float(lora_cfg.get('dropout', 0.0)),
+        lora_target_linear=bool(lora_cfg.get('target_linear', True)),
+        lora_target_qkv=bool(lora_cfg.get('target_qkv', True)),
+        extended_chunkwise_enabled=bool(extended_cfg.get('enabled', False)),
+        extended_chunkwise_multiplier=int(extended_cfg.get('multiplier', 3)),
+        extended_chunkwise_chunk_weight_0=float(chunk_loss_weights[0]),
+        extended_chunkwise_chunk_weight_1=float(chunk_loss_weights[1]),
+        extended_chunkwise_chunk_weight_2=float(chunk_loss_weights[2]),
+        extended_chunkwise_constant_weight=float(extended_cfg.get('temporally_constant_weight', 0.2)),
+        extended_chunkwise_chunkwise_weight=float(extended_cfg.get('chunk_wise_weight', 0.8)),
     )
-    
-    # Create model (Accelerator will handle device placement and DDP)
-    model = Motus(model_config)
-    
+    return Motus(model_config)
+
+
+def apply_lora_finetune_if_enabled(model: Motus, config: OmegaConf):
+    lora_cfg = _get_lora_config(config)
+    if not bool(lora_cfg.get('enabled', False)):
+        return None
+    return model.enable_action_und_lora_finetune(
+        rank=int(lora_cfg.get('rank', 8)),
+        alpha=float(lora_cfg.get('alpha', 16.0)),
+        dropout=float(lora_cfg.get('dropout', 0.0)),
+        target_linear=bool(lora_cfg.get('target_linear', True)),
+        target_qkv=bool(lora_cfg.get('target_qkv', True)),
+    )
+
+
+def create_optimizer_and_scheduler(model: Motus, config: OmegaConf) -> tuple:
+    """Create optimizer and scheduler after all finetuning adapters are configured."""
     # Optimizer - parameter groups for separate WAN (video model) learning rate
     base_lr = float(config.training.learning_rate)
     wan_lr = float(getattr(config.training, 'wan_learning_rate', base_lr))
@@ -489,6 +634,8 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple:
         param_groups.append({'params': other_params, 'lr': base_lr})
     if len(wan_params) > 0:
         param_groups.append({'params': wan_params, 'lr': wan_lr})
+    if not param_groups:
+        raise ValueError("No trainable parameters found for optimizer")
 
     optimizer = torch.optim.AdamW(
         param_groups,
@@ -499,6 +646,14 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple:
     # Scheduler
     scheduler = create_scheduler(optimizer, config)
     
+    return optimizer, scheduler
+
+
+def create_model_and_optimizer(config: OmegaConf) -> tuple:
+    """Create UniDiffuser model and optimizer from config."""
+    model = create_model(config)
+    apply_lora_finetune_if_enabled(model, config)
+    optimizer, scheduler = create_optimizer_and_scheduler(model, config)
     return model, optimizer, scheduler
 
 def create_dataloaders(config: OmegaConf, rank: int, world_size: int) -> tuple:
@@ -550,6 +705,13 @@ def main():
     # System settings
     parser.add_argument("--checkpoint_dir", type=str, default=None, help="Override checkpoint directory")
     parser.add_argument("--log_level", type=str, default="INFO", help="Logging level")
+    parser.add_argument("--max_steps", type=int, default=None, help="Override training.max_steps")
+    parser.add_argument("--save_interval", type=int, default=None, help="Override system.save_interval")
+    parser.add_argument("--log_interval", type=int, default=None, help="Override system.log_interval")
+    parser.add_argument("--val_interval", type=int, default=None, help="Override system.val_interval")
+    parser.add_argument("--num_workers", type=int, default=None, help="Override system.num_workers")
+    parser.add_argument("--pin_memory", action="store_true", help="Override system.pin_memory=true")
+    parser.add_argument("--no_pin_memory", action="store_true", help="Override system.pin_memory=false")
     
     # Logging settings
     parser.add_argument("--report_to", type=str, default=None, 
@@ -568,6 +730,22 @@ def main():
     config = load_config(args.config)
     if args.checkpoint_dir is not None:
         config.system.checkpoint_dir = args.checkpoint_dir
+    if args.max_steps is not None:
+        config.training.max_steps = args.max_steps
+    if args.save_interval is not None:
+        config.system.save_interval = args.save_interval
+    if args.log_interval is not None:
+        config.system.log_interval = args.log_interval
+    if args.val_interval is not None:
+        config.system.val_interval = args.val_interval
+    if args.num_workers is not None:
+        config.system.num_workers = args.num_workers
+    if args.pin_memory and args.no_pin_memory:
+        raise ValueError("--pin_memory and --no_pin_memory are mutually exclusive")
+    if args.pin_memory:
+        config.system.pin_memory = True
+    if args.no_pin_memory:
+        config.system.pin_memory = False
     if args.report_to is not None:
         config.logging.report_to = args.report_to
     if args.wandb_project is not None:
@@ -596,13 +774,17 @@ def main():
     
     # Initialize Accelerator with DeepSpeed (if provided)
     accelerator_project_config = ProjectConfiguration(total_limit=20)
+    accelerator_log_with = config.logging.get('report_to', 'tensorboard')
+    if accelerator_log_with == "none":
+        accelerator_log_with = None
+
     accelerator = Accelerator(
         deepspeed_plugin=DeepSpeedPlugin(
             hf_ds_config=args.deepspeed
         ) if args.deepspeed is not None else None,
         gradient_accumulation_steps=config.training.get('gradient_accumulation_steps', 1),
         mixed_precision="bf16",
-        log_with=config.logging.get('report_to', 'tensorboard'),
+        log_with=accelerator_log_with,
         project_dir=config.system.checkpoint_dir,
         project_config=accelerator_project_config,
     )
@@ -634,6 +816,8 @@ def main():
     # Initialize TensorBoard writer
     tb_writer = None
     if rank == 0 and "tensorboard" in report_to:
+        if SummaryWriter is None:
+            raise ModuleNotFoundError("tensorboard is required when logging.report_to includes tensorboard")
         tb_log_dir = os.path.join(config.system.checkpoint_dir, config.logging.tensorboard_log_dir)
         tb_writer = SummaryWriter(log_dir=tb_log_dir)
         logger.info(f"TensorBoard logs will be saved to: {tb_log_dir}")
@@ -649,19 +833,36 @@ def main():
         )
     
     try:
-        # Create model and optimizer
-        logger.info("Creating UniDiffuser model and optimizer...")
-        model, optimizer, scheduler = create_model_and_optimizer(config)
+        # Create model first. Finetuning adapters are applied after checkpoint load.
+        logger.info("Creating UniDiffuser model...")
+        model = create_model(config)
 
-        # Optional: load finetune weights for partial init
+        # Optional: load finetune weights before LoRA injection. Full RobotWin
+        # checkpoints must not go through load_pretrain_weights because that
+        # path intentionally skips action input/decoder layers.
         finetune_ckpt = getattr(config.finetune, 'checkpoint_path', None) if hasattr(config, 'finetune') else None
         if getattr(config, 'training_mode', 'finetune') == 'finetune' and finetune_ckpt:
-            logger.info(f"Loading finetune weights from {finetune_ckpt} (partial)...")
+            load_method = getattr(config.finetune, 'load_method', 'pretrain_partial')
+            logger.info(f"Loading finetune weights from {finetune_ckpt} ({load_method})...")
             try:
-                (model.module if hasattr(model, 'module') else model).load_pretrain_weights(finetune_ckpt)
-                logger.info("Finetune weights loaded (partial).")
+                unwrapped = model.module if hasattr(model, 'module') else model
+                if load_method == 'full':
+                    unwrapped.load_checkpoint(finetune_ckpt, strict=False)
+                elif load_method == 'pretrain_partial':
+                    unwrapped.load_pretrain_weights(finetune_ckpt)
+                else:
+                    raise ValueError(f"Unknown finetune.load_method: {load_method}")
+                logger.info("Finetune weights loaded.")
             except Exception as e:
                 logger.error(f"Failed to load finetune weights: {e}")
+                raise
+
+        lora_stats = apply_lora_finetune_if_enabled(model, config)
+        if lora_stats is not None:
+            logger.info(f"LoRA finetuning stats: {lora_stats}")
+
+        logger.info("Creating optimizer and scheduler...")
+        optimizer, scheduler = create_optimizer_and_scheduler(model, config)
         
         # Create dataloaders
         logger.info("Creating dataloaders...")
@@ -671,15 +872,21 @@ def main():
         def save_model_hook(models, weights, output_dir):
             """Custom save hook to save model safely and avoid NCCL timeouts."""
             if accelerator.is_main_process:
+                save_lora_only = bool(getattr(config.system, "save_lora_only", False))
                 logger.info(f"Saving model to {output_dir}")
                 for i, model_to_save in enumerate(models):
                     # Unwrap the model if it's wrapped by DDP/DeepSpeed
                     unwrapped_model = accelerator.unwrap_model(model_to_save)
-                    
-                    # Save using torch.save instead of accelerator's default method
-                    model_save_path = os.path.join(output_dir, f"pytorch_model_{i}.bin")
-                    torch.save(unwrapped_model.state_dict(), model_save_path)
+
+                    if save_lora_only:
+                        model_save_path = os.path.join(output_dir, f"lora_model_{i}.pt")
+                        torch.save(collect_lora_state_dict(unwrapped_model), model_save_path)
+                    else:
+                        # Save using torch.save instead of accelerator's default method
+                        model_save_path = os.path.join(output_dir, f"pytorch_model_{i}.bin")
+                        torch.save(unwrapped_model.state_dict(), model_save_path)
                     logger.info(f"Model {i} saved to {model_save_path}")
+                weights.clear()
         
         # Register the custom save hook
         accelerator.register_save_state_pre_hook(save_model_hook)

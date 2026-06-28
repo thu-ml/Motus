@@ -104,6 +104,38 @@ class UndExpertBlock(nn.Module):
             nn.Linear(config.ffn_dim, config.dim)
         )
 
+    def enable_wan_und_qkv_lora(self, rank: int, alpha: float, dropout: float = 0.0) -> int:
+        if rank <= 0:
+            raise ValueError(f"LoRA rank must be positive, got {rank}")
+        if hasattr(self, "wan_und_qkv_lora_A") and hasattr(self, "wan_und_qkv_lora_B"):
+            self.wan_und_qkv_lora_A.requires_grad = True
+            self.wan_und_qkv_lora_B.requires_grad = True
+            return self.wan_und_qkv_lora_A.numel() + self.wan_und_qkv_lora_B.numel()
+
+        dtype = self.wan_und_qkv.dtype
+        device = self.wan_und_qkv.device
+        a = torch.empty((3, self.config.dim, rank), device=device, dtype=torch.float32)
+        nn.init.kaiming_uniform_(a, a=math.sqrt(5))
+        b = torch.zeros((3, rank, self.wan_num_heads, self.wan_head_dim), device=device, dtype=torch.float32)
+        self.wan_und_qkv_lora_A = nn.Parameter(a.to(dtype=dtype))
+        self.wan_und_qkv_lora_B = nn.Parameter(b.to(dtype=dtype))
+        self.wan_und_qkv_lora_scaling = float(alpha) / float(rank)
+        self.wan_und_qkv_lora_dropout = float(dropout)
+        return self.wan_und_qkv_lora_A.numel() + self.wan_und_qkv_lora_B.numel()
+
+    def project_wan_und_qkv(self, norm_und: torch.Tensor) -> torch.Tensor:
+        qkv = torch.einsum("BTD,KNDE->KBTNE", norm_und, self.wan_und_qkv)
+        if not hasattr(self, "wan_und_qkv_lora_A"):
+            return qkv
+        if getattr(self, "wan_und_qkv_lora_disabled", False) or getattr(self, "lora_disabled", False):
+            return qkv
+        x = norm_und
+        if self.wan_und_qkv_lora_dropout > 0:
+            x = F.dropout(x, p=self.wan_und_qkv_lora_dropout, training=self.training)
+        hidden = torch.einsum("BTD,KDR->BTKR", x, self.wan_und_qkv_lora_A)
+        delta = torch.einsum("BTKR,KRNE->KBTNE", hidden, self.wan_und_qkv_lora_B)
+        return qkv + delta * self.wan_und_qkv_lora_scaling
+
 
 class UndExpert(nn.Module):
     """

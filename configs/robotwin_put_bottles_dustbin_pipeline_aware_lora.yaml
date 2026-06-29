@@ -18,6 +18,8 @@ dataset:
 
 model:
   load_pretrained_backbones: false
+  activation_checkpointing: true
+  activation_checkpointing_use_reentrant: false
   wan:
     config_path: "/home/hnliu/storage2/users/hnliu_data/WAM_old/Motus/pretrained_models/Wan2.2-TI2V-5B"
     checkpoint_path: "/home/hnliu/storage2/users/hnliu_data/WAM_old/Motus/pretrained_models/Wan2.2-TI2V-5B"
@@ -73,7 +75,8 @@ model:
     max_value: 0.9999
 
 training:
-  batch_size: 1
+  batch_size: 16
+  gradient_accumulation_steps: 1
   max_steps: 3000
   learning_rate: 5.0e-5
   weight_decay: 0.01

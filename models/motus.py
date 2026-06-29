@@ -11,6 +11,7 @@ from pathlib import Path
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Tuple
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 BAK_ROOT = str((Path(__file__).parent.parent / "bak").resolve())
 if BAK_ROOT not in sys.path:
@@ -70,6 +71,8 @@ class MotusConfig:
     
     # Training settings
     batch_size: int = 8
+    activation_checkpointing: bool = False
+    activation_checkpointing_use_reentrant: bool = False
 
     # Training mode
     training_mode: str = 'finetune'  # 'pretrain' or 'finetune'
@@ -675,6 +678,11 @@ class Motus(nn.Module):
         self.video_module = VideoModule(self.video_model, self.dtype, self.device, self.grid_sizes)
         self.und_module = UndModule(self.vlm_model, self.und_expert, self.config, self.dtype, self.device)
         self.action_module = ActionModule(self.action_expert, self.config, self.video_model, self.vlm_model, self.dtype, self.device)
+        if bool(getattr(config, "activation_checkpointing", False)):
+            logger.info(
+                "Activation checkpointing enabled for Motus layer blocks (use_reentrant=%s)",
+                bool(getattr(config, "activation_checkpointing_use_reentrant", False)),
+            )
 
         # Initialize t distributions from config
         time_dist_config = getattr(config, 'time_distribution', {})
@@ -843,6 +851,86 @@ class Motus(nn.Module):
             for module, attr, value in saved_states:
                 setattr(module, attr, value)
 
+    def _use_activation_checkpointing(self) -> bool:
+        return self.training and bool(getattr(self.config, "activation_checkpointing", False))
+
+    def _process_mot_layer(
+        self,
+        video_tokens: torch.Tensor,
+        action_tokens: torch.Tensor,
+        und_tokens: torch.Tensor,
+        video_adaln_params: torch.Tensor,
+        action_adaln_params: torch.Tensor,
+        processed_t5_context: torch.Tensor,
+        layer_idx: int,
+        attn_mask: Optional[Any] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        def layer_forward(
+            layer_video_tokens: torch.Tensor,
+            layer_action_tokens: torch.Tensor,
+            layer_und_tokens: torch.Tensor,
+            layer_video_adaln_params: torch.Tensor,
+            layer_action_adaln_params: torch.Tensor,
+            layer_t5_context: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            video_adaln_modulation = self.video_module.compute_adaln_modulation(
+                layer_video_adaln_params,
+                layer_idx,
+            )
+            action_adaln_modulation = self.action_module.compute_adaln_modulation(
+                layer_action_adaln_params,
+                layer_idx,
+            )
+            layer_video_tokens, layer_action_tokens, layer_und_tokens = self.video_module.process_joint_attention(
+                layer_video_tokens,
+                layer_action_tokens,
+                video_adaln_modulation,
+                action_adaln_modulation,
+                layer_idx,
+                self.action_expert.blocks[layer_idx],
+                layer_und_tokens,
+                self.und_expert.blocks[layer_idx],
+                attn_mask=attn_mask,
+            )
+            layer_video_tokens = self.video_module.process_cross_attention(
+                layer_video_tokens,
+                layer_video_adaln_params,
+                layer_idx,
+                layer_t5_context,
+            )
+            layer_video_tokens = self.video_module.process_ffn(
+                layer_video_tokens,
+                video_adaln_modulation,
+                layer_idx,
+            )
+            layer_action_tokens = self.action_module.process_ffn(
+                layer_action_tokens,
+                action_adaln_modulation,
+                layer_idx,
+            )
+            layer_und_tokens = self.und_module.process_ffn(layer_und_tokens, layer_idx)
+            return layer_video_tokens, layer_action_tokens, layer_und_tokens
+
+        if self._use_activation_checkpointing():
+            return activation_checkpoint(
+                layer_forward,
+                video_tokens,
+                action_tokens,
+                und_tokens,
+                video_adaln_params,
+                action_adaln_params,
+                processed_t5_context,
+                use_reentrant=bool(getattr(self.config, "activation_checkpointing_use_reentrant", False)),
+            )
+        return layer_forward(
+            video_tokens,
+            action_tokens,
+            und_tokens,
+            video_adaln_params,
+            action_adaln_params,
+            processed_t5_context,
+        )
+
     def load_checkpoint(self, path: str, strict: bool = True) -> Dict:
         """Load model checkpoint."""
         # Handle directory path
@@ -1005,24 +1093,15 @@ class Motus(nn.Module):
         with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
             # Process through 30 layers - modality-grouped execution
             for layer_idx in range(self.config.num_layers):
-                # Compute AdaLN modulation once per layer using pre-computed parameters
-                video_adaln_modulation = self.video_module.compute_adaln_modulation(video_adaln_params, layer_idx)
-                action_adaln_modulation = self.action_module.compute_adaln_modulation(action_adaln_params, layer_idx)
-                
-                # Trimodal MoT: WAN + Action + Understanding Expert joint attention
-                video_tokens, action_tokens, und_tokens = self.video_module.process_joint_attention(
-                    video_tokens, action_tokens, video_adaln_modulation, action_adaln_modulation, layer_idx, 
-                    self.action_expert.blocks[layer_idx],
-                    und_tokens, self.und_expert.blocks[layer_idx]
+                video_tokens, action_tokens, und_tokens = self._process_mot_layer(
+                    video_tokens,
+                    action_tokens,
+                    und_tokens,
+                    video_adaln_params,
+                    action_adaln_params,
+                    processed_t5_context,
+                    layer_idx,
                 )
-
-                # WAN cross
-                video_tokens = self.video_module.process_cross_attention(video_tokens, video_adaln_params, layer_idx, processed_t5_context)
-
-                # FFNs: WAN, Action, Understanding (each processes their own FFN)
-                video_tokens = self.video_module.process_ffn(video_tokens, video_adaln_modulation, layer_idx)
-                action_tokens = self.action_module.process_ffn(action_tokens, action_adaln_modulation, layer_idx)
-                und_tokens = self.und_module.process_ffn(und_tokens, layer_idx)
                 
         
             # 4. Heads + Losses
@@ -1409,23 +1488,16 @@ class Motus(nn.Module):
 
         with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
             for layer_idx in range(self.config.num_layers):
-                video_adaln_modulation = self.video_module.compute_adaln_modulation(video_adaln_params, layer_idx)
-                action_adaln_modulation = self.action_module.compute_adaln_modulation(action_adaln_params, layer_idx)
-                video_tokens, action_tokens, und_tokens = self.video_module.process_joint_attention(
+                video_tokens, action_tokens, und_tokens = self._process_mot_layer(
                     video_tokens,
                     action_tokens,
-                    video_adaln_modulation,
-                    action_adaln_modulation,
-                    layer_idx,
-                    self.action_expert.blocks[layer_idx],
                     und_tokens,
-                    self.und_expert.blocks[layer_idx],
+                    video_adaln_params,
+                    action_adaln_params,
+                    processed_t5_context,
+                    layer_idx,
                     attn_mask=attn_mask,
                 )
-                video_tokens = self.video_module.process_cross_attention(video_tokens, video_adaln_params, layer_idx, processed_t5_context)
-                video_tokens = self.video_module.process_ffn(video_tokens, video_adaln_modulation, layer_idx)
-                action_tokens = self.action_module.process_ffn(action_tokens, action_adaln_modulation, layer_idx)
-                und_tokens = self.und_module.process_ffn(und_tokens, layer_idx)
 
             video_pred = self.video_module.apply_output_head(video_tokens, video_head_time_emb)
             action_velocity = self._decode_extended_action_velocity(action_tokens, action_head_time_emb, action_layout)

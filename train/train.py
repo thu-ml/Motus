@@ -200,6 +200,14 @@ class UniDiffuserTrainer:
         self.tb_writer = tb_writer
         self.accelerator = accelerator
         self.config = config
+        if self.config is not None and hasattr(self.config, "training"):
+            self.gradient_accumulation_steps = max(
+                1,
+                int(self.config.training.get("gradient_accumulation_steps", 1)),
+            )
+        else:
+            self.gradient_accumulation_steps = 1
+        self.micro_step = 0
         
         # Create checkpoint directory
         if rank == 0:
@@ -211,6 +219,12 @@ class UniDiffuserTrainer:
         
         logger.info(f"Motus Trainer initialized on rank {rank}/{world_size}")
         logger.info(f"Logging backends: {report_to}")
+        logger.info(
+            "Gradient accumulation steps: %d (effective global batch ~= per_device_batch * %d ranks * %d)",
+            self.gradient_accumulation_steps,
+            world_size,
+            self.gradient_accumulation_steps,
+        )
 
     def save_checkpoint(self, suffix: str = ""):
         """Save complete training state using accelerator."""
@@ -349,10 +363,9 @@ class UniDiffuserTrainer:
             current_lr = self.optimizer.param_groups[0]['lr']
             logger.info(f"Current learning rate after checkpoint load (optimizer): {current_lr:.2e}")
     
-    def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
-        """Single training step for UniDiffuser."""
+    def train_step(self, batch: Dict[str, Any]) -> tuple[Dict[str, float], bool]:
+        """Run one micro-batch and return whether an optimizer update happened."""
         self.model.train()
-        self.optimizer.zero_grad()
         
         first_frame = batch['first_frame'].to(self.device, dtype=self.dtype)          # [B, C, H, W]
         video_frames = batch['video_frames'].to(self.device, dtype=self.dtype)        # [B, num_video_frames, C, H, W]
@@ -402,24 +415,33 @@ class UniDiffuserTrainer:
         
         # Backward pass (using accelerator if available)
         if hasattr(self, 'accelerator') and self.accelerator is not None:
-            self.accelerator.backward(total_loss)
+            with self.accelerator.accumulate(self.model):
+                self.accelerator.backward(total_loss)
+                did_optimizer_step = bool(self.accelerator.sync_gradients)
+                if did_optimizer_step:
+                    grad_clip_norm = self.config.training.grad_clip_norm if hasattr(self.config.training, 'grad_clip_norm') else 1.0
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
+                    self.optimizer.step()
+                    if self.scheduler:
+                        self.scheduler.step()
+                    self.optimizer.zero_grad()
         else:
-            total_loss.backward()
-        
-        # Gradient clipping
-        grad_clip_norm = self.config.training.grad_clip_norm if hasattr(self.config.training, 'grad_clip_norm') else 1.0
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
-        
-        # Optimizer step
-        self.optimizer.step()
-        
-        if self.scheduler:
-            self.scheduler.step()
+            scaled_loss = total_loss / self.gradient_accumulation_steps
+            scaled_loss.backward()
+            self.micro_step += 1
+            did_optimizer_step = (self.micro_step % self.gradient_accumulation_steps == 0)
+            if did_optimizer_step:
+                grad_clip_norm = self.config.training.grad_clip_norm if hasattr(self.config.training, 'grad_clip_norm') else 1.0
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
+                self.optimizer.step()
+                if self.scheduler:
+                    self.scheduler.step()
+                self.optimizer.zero_grad()
         
         # Convert to float for logging
         metrics = {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
         
-        return metrics
+        return metrics, did_optimizer_step
     
     def train(self, max_steps: int, resume_from: Optional[str] = None, val_interval: int = 500, reset_scheduler: Optional[bool] = None):
         """
@@ -447,9 +469,12 @@ class UniDiffuserTrainer:
         
         start_time = time.time()
         
-        # Step-based training loop
+        # Step-based training loop. global_step counts optimizer updates, not micro-batches.
         data_iter = iter(self.train_dataloader)
         epoch = 0
+        update_start_time = time.time()
+        metric_buffer: Dict[str, float] = {}
+        buffered_micro_batches = 0
         
         while self.global_step < max_steps:
             try:
@@ -465,13 +490,28 @@ class UniDiffuserTrainer:
             if batch is None:  # Handle None batches
                 continue
                 
-            step_start_time = time.time()
+            if buffered_micro_batches == 0:
+                update_start_time = time.time()
 
             # Training step
-            metrics = self.train_step(batch)
+            metrics, did_optimizer_step = self.train_step(batch)
+            for key, value in metrics.items():
+                if isinstance(value, (int, float)):
+                    metric_buffer[key] = metric_buffer.get(key, 0.0) + float(value)
+            buffered_micro_batches += 1
+
+            if not did_optimizer_step:
+                continue
             
-            step_time = time.time() - step_start_time
+            step_time = time.time() - update_start_time
             self.global_step += 1
+            metrics = {
+                key: value / max(1, buffered_micro_batches)
+                for key, value in metric_buffer.items()
+            }
+            metrics["micro_batches"] = float(buffered_micro_batches)
+            metric_buffer = {}
+            buffered_micro_batches = 0
             
             # Logging
             if self.global_step % self.log_interval == 0 and self.rank == 0:
@@ -588,6 +628,8 @@ def create_model(config: OmegaConf) -> Motus:
         video_height=config.common.video_height,
         video_width=config.common.video_width,
         batch_size=config.training.batch_size,
+        activation_checkpointing=bool(config.model.get('activation_checkpointing', False)),
+        activation_checkpointing_use_reentrant=bool(config.model.get('activation_checkpointing_use_reentrant', False)),
         video_loss_weight=config.model.loss_weights.video_loss_weight,
         action_loss_weight=config.model.loss_weights.action_loss_weight,
         training_mode=getattr(config, 'training_mode', 'finetune'),

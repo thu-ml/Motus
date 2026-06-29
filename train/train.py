@@ -55,7 +55,12 @@ def move_nested_to_device(value: Any, device: torch.device):
 
 
 def _is_lora_key(name: str) -> bool:
-    return "lora_A" in name or "lora_B" in name
+    return (
+        "lora_A" in name
+        or "lora_B" in name
+        or "pipeline_chunk_embedding" in name
+        or "pipeline_stage_embedding" in name
+    )
 
 
 def collect_lora_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
@@ -593,8 +598,12 @@ def create_model(config: OmegaConf) -> Motus:
         lora_dropout=float(lora_cfg.get('dropout', 0.0)),
         lora_target_linear=bool(lora_cfg.get('target_linear', True)),
         lora_target_qkv=bool(lora_cfg.get('target_qkv', True)),
+        time_distribution=dict(config.model.get('time_distribution', {})),
         extended_chunkwise_enabled=bool(extended_cfg.get('enabled', False)),
         extended_chunkwise_multiplier=int(extended_cfg.get('multiplier', 3)),
+        extended_chunkwise_pipeline_depth=int(extended_cfg.get('pipeline_depth', 3)),
+        extended_chunkwise_chunk_causal_mask=bool(extended_cfg.get('chunk_causal_mask', True)),
+        extended_chunkwise_pipeline_embeddings=bool(extended_cfg.get('pipeline_embeddings', True)),
         extended_chunkwise_chunk_weight_0=float(chunk_loss_weights[0]),
         extended_chunkwise_chunk_weight_1=float(chunk_loss_weights[1]),
         extended_chunkwise_chunk_weight_2=float(chunk_loss_weights[2]),

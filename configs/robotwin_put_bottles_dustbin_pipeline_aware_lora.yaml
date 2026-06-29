@@ -1,0 +1,110 @@
+common:
+  action_dim: 14
+  state_dim: 14
+  num_video_frames: 8
+  video_height: 384
+  video_width: 320
+  global_downsample_rate: 3
+  video_action_freq_ratio: 2
+
+dataset:
+  type: "robotwin"
+  dataset_dir: "/home/hnliu/storage2/users/hnliu_data/wam_accel/datasets/robotwin2_motus_put_bottles_dustbin"
+  data_mode: "both"
+  task_mode: "single"
+  task_name: "put_bottles_dustbin"
+  randomized_limit_per_task: 500
+  image_aug: false
+
+model:
+  load_pretrained_backbones: false
+  wan:
+    config_path: "/home/hnliu/storage2/users/hnliu_data/WAM_old/Motus/pretrained_models/Wan2.2-TI2V-5B"
+    checkpoint_path: "/home/hnliu/storage2/users/hnliu_data/WAM_old/Motus/pretrained_models/Wan2.2-TI2V-5B"
+    vae_path: "/home/hnliu/storage2/users/hnliu_data/WAM_old/Motus/pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    precision: "bfloat16"
+  vlm:
+    checkpoint_path: "/home/hnliu/storage2/users/hnliu_data/WAM_old/Motus/pretrained_models/Qwen3-VL-2B-Instruct"
+    precision: "bfloat16"
+    frozen: true
+  action_expert:
+    hidden_size: 1024
+    ffn_dim_multiplier: 4
+    norm_eps: 1e-5
+  und_expert:
+    hidden_size: 512
+    ffn_dim_multiplier: 4
+    norm_eps: 1e-5
+    vlm:
+      input_dim: 2048
+      projector_type: "mlp3x_silu"
+  time_distribution:
+    timestep_sample_method: "logit_normal"
+    sigmoid_scale: 1.0
+    min_t: 0.0
+    max_t: 1.0
+  inference:
+    num_inference_timesteps: 3
+  loss_weights:
+    video_loss_weight: 1.0
+    action_loss_weight: 1.0
+  lora:
+    enabled: true
+    rank: 8
+    alpha: 16.0
+    dropout: 0.0
+    target_linear: true
+    target_qkv: true
+  extended_chunkwise_finetune:
+    enabled: true
+    multiplier: 3
+    pipeline_depth: 3
+    chunk_causal_mask: true
+    pipeline_embeddings: true
+    temporally_constant_weight: 0.2
+    chunk_wise_weight: 0.8
+    chunk_loss_weights: [1.0, 0.7, 0.5]
+  ema:
+    enabled: false
+    update_after_step: 0
+    inv_gamma: 1.0
+    power: 0.75
+    min_value: 0.0
+    max_value: 0.9999
+
+training:
+  batch_size: 1
+  max_steps: 3000
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  scheduler_type: "linear"
+  warmup_steps: 100
+  cycle_length: 3000
+  f_max: 1.0
+  f_min: 1.0
+  grad_clip_norm: 0.5
+  use_amp: true
+  find_unused_parameters: false
+
+system:
+  checkpoint_dir: "/home/hnliu/storage2/users/hnliu_data/wam_accel/runs/put_bottles_dustbin_pipeline_aware_lora"
+  log_level: "INFO"
+  log_interval: 20
+  save_interval: 500
+  val_interval: 1000
+  num_workers: 0
+  pin_memory: false
+  save_lora_only: true
+
+logging:
+  report_to: "none"
+  wandb_project: "motus"
+  tensorboard_log_dir: "tensorboard_logs"
+  run_name: "put_bottles_dustbin_pipeline_aware_lora"
+
+resume:
+  checkpoint_path: null
+
+finetune:
+  checkpoint_path: "/home/hnliu/storage2/users/hnliu_data/WAM_old/Motus/pretrained_models/Motus_robotwin2"
+  load_method: "full"

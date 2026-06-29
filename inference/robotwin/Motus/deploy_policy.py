@@ -249,6 +249,11 @@ class MotusPolicy:
 
         hidden_size = model_cfg['action_expert']['hidden_size']
         ffn_multiplier = model_cfg['action_expert']['ffn_dim_multiplier']
+        extended_cfg = dict(model_cfg.get("extended_chunkwise_finetune", {}) or {})
+        extended_cfg.update(self.lora_checkpoint_config.get("extended_chunkwise_finetune", {}) or {})
+        chunk_loss_weights = list(extended_cfg.get("chunk_loss_weights", [1.0, 0.7, 0.5]))
+        while len(chunk_loss_weights) < 3:
+            chunk_loss_weights.append(chunk_loss_weights[-1] if chunk_loss_weights else 1.0)
 
         config = MotusConfig(
             # Paths for config loading only (no weights loaded)
@@ -295,6 +300,16 @@ class MotusPolicy:
             lora_dropout=self.lora_dropout,
             lora_target_linear=self.lora_target_linear,
             lora_target_qkv=self.lora_target_qkv,
+            extended_chunkwise_enabled=bool(extended_cfg.get("enabled", False)),
+            extended_chunkwise_multiplier=int(extended_cfg.get("multiplier", 3)),
+            extended_chunkwise_pipeline_depth=int(extended_cfg.get("pipeline_depth", 3)),
+            extended_chunkwise_chunk_causal_mask=bool(extended_cfg.get("chunk_causal_mask", True)),
+            extended_chunkwise_pipeline_embeddings=bool(extended_cfg.get("pipeline_embeddings", True)),
+            extended_chunkwise_chunk_weight_0=float(chunk_loss_weights[0]),
+            extended_chunkwise_chunk_weight_1=float(chunk_loss_weights[1]),
+            extended_chunkwise_chunk_weight_2=float(chunk_loss_weights[2]),
+            extended_chunkwise_constant_weight=float(extended_cfg.get("temporally_constant_weight", 0.2)),
+            extended_chunkwise_chunkwise_weight=float(extended_cfg.get("chunk_wise_weight", 0.8)),
         )
 
         return config

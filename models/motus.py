@@ -685,7 +685,7 @@ class Motus(nn.Module):
             )
 
         # Initialize t distributions from config
-        time_dist_config = getattr(config, 'time_distribution', {})
+        time_dist_config = getattr(config, 'time_distribution', {}) or {}
         model_config = {
             'timestep_sample_method': time_dist_config.get('timestep_sample_method', 'logit_normal'),
             'sigmoid_scale': time_dist_config.get('sigmoid_scale', 1.0),

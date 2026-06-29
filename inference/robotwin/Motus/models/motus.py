@@ -675,7 +675,7 @@ class Motus(nn.Module):
         self.action_module = ActionModule(self.action_expert, self.config, self.video_model, self.vlm_model, self.dtype, self.device)
 
         # Initialize t distributions from config
-        time_dist_config = getattr(config, 'time_distribution', {})
+        time_dist_config = getattr(config, 'time_distribution', {}) or {}
         model_config = {
             'timestep_sample_method': time_dist_config.get('timestep_sample_method', 'logit_normal'),
             'sigmoid_scale': time_dist_config.get('sigmoid_scale', 1.0),
@@ -1514,6 +1514,7 @@ class Motus(nn.Module):
         base_future_latent_frames = self.config.num_video_frames // 4
         base_total_latent_frames = 1 + base_future_latent_frames
         extended_total_latent_frames = 1 + base_future_latent_frames * multiplier
+        chunk_stage, _, _ = self._extended_pipeline_stage_profile(B, multiplier)
 
         language_embeddings = [emb.to(self.device).to(self.dtype) for emb in language_embeddings]
         state = state.to(self.device).to(self.dtype)

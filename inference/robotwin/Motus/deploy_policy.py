@@ -251,6 +251,8 @@ class MotusPolicy:
         ffn_multiplier = model_cfg['action_expert']['ffn_dim_multiplier']
         extended_cfg = dict(model_cfg.get("extended_chunkwise_finetune", {}) or {})
         extended_cfg.update(self.lora_checkpoint_config.get("extended_chunkwise_finetune", {}) or {})
+        time_distribution = dict(model_cfg.get("time_distribution", {}) or {})
+        time_distribution.update(self.lora_checkpoint_config.get("time_distribution", {}) or {})
         chunk_loss_weights = list(extended_cfg.get("chunk_loss_weights", [1.0, 0.7, 0.5]))
         while len(chunk_loss_weights) < 3:
             chunk_loss_weights.append(chunk_loss_weights[-1] if chunk_loss_weights else 1.0)
@@ -285,6 +287,7 @@ class MotusPolicy:
             num_video_frames=common['num_video_frames'],
             video_loss_weight=1.0,
             action_loss_weight=1.0,
+            time_distribution=time_distribution,
             
             # Inference config
             batch_size=1,
@@ -375,9 +378,11 @@ class MotusPolicy:
         
         current_frame = self.obs_cache[-1]
         execute_actions = self._get_execute_actions()
+        inference_cfg = dict(self.config_dict.get('model', {}).get('inference', {}) or {})
+        inference_cfg.update(self.lora_checkpoint_config.get("inference", {}) or {})
         configured_steps = int(os.environ.get(
             "MOTUS_NUM_INFERENCE_STEPS",
-            self.config_dict['model']['inference']['num_inference_timesteps'],
+            inference_cfg.get('num_inference_timesteps', 10),
         ))
 
         # Encode instruction with T5

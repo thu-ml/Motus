@@ -75,7 +75,7 @@ model:
     max_value: 0.9999
 
 training:
-  batch_size: 16
+  batch_size: 32
   gradient_accumulation_steps: 1
   max_steps: 3000
   learning_rate: 5.0e-5
@@ -103,7 +103,7 @@ logging:
   report_to: "none"
   wandb_project: "motus"
   tensorboard_log_dir: "tensorboard_logs"
-  run_name: "put_bottles_dustbin_pipeline_aware_lora"
+  run_name: "put_bottles_dustbin_pipeline_aware_lora_bs32_ckpt"
 
 resume:
   checkpoint_path: null

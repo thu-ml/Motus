@@ -3,7 +3,6 @@
 # Implements MoT (Mixture of Tokens) architecture with unified attention
 
 import sys
-import json
 import torch
 import logging
 import torch.nn as nn
@@ -17,7 +16,6 @@ BAK_ROOT = str((Path(__file__).parent.parent / "bak").resolve())
 if BAK_ROOT not in sys.path:
     sys.path.insert(0, BAK_ROOT)
 
-from utils.common import get_t_distribution
 from wan.modules.model import sinusoidal_embedding_1d
 from transformers import Qwen3VLForConditionalGeneration, AutoConfig
 from .wan_model import WanVideoModel
@@ -26,7 +24,6 @@ from .und_expert import UndExpert, UndExpertConfig
 from .lora import add_lora_to_linear_modules, mark_only_lora_as_trainable
 # Add Flow-Matching schedulers
 from wan.utils.fm import FlowMatchScheduler
-from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +70,7 @@ class MotusConfig:
     batch_size: int = 8
     activation_checkpointing: bool = False
     activation_checkpointing_use_reentrant: bool = False
+    activation_checkpointing_interval: int = 1
 
     # Training mode
     training_mode: str = 'finetune'  # 'pretrain' or 'finetune'
@@ -85,16 +83,7 @@ class MotusConfig:
     # None = default behavior (load), False = skip loading (init from config only)
     load_pretrained_backbones: Optional[bool] = None
 
-    # LoRA finetuning settings for extended chunk-wise adaptation.
-    lora_enabled: bool = False
-    lora_rank: int = 8
-    lora_alpha: float = 16.0
-    lora_dropout: float = 0.0
-    lora_target_linear: bool = True
-    lora_target_qkv: bool = True
-
     # Streaming-Diffusion-Policy style extended action finetuning.
-    time_distribution: Optional[Dict[str, Any]] = None
     extended_chunkwise_enabled: bool = False
     extended_chunkwise_multiplier: int = 3
     extended_chunkwise_pipeline_depth: int = 3
@@ -105,6 +94,8 @@ class MotusConfig:
     extended_chunkwise_chunk_weight_2: float = 0.5
     extended_chunkwise_constant_weight: float = 0.2
     extended_chunkwise_chunkwise_weight: float = 0.8
+    rolling_action_distill_enabled: bool = False
+    rolling_action_distill_weight: float = 0.0
 
     def __post_init__(self):
         """Calculate derived parameters."""
@@ -680,18 +671,10 @@ class Motus(nn.Module):
         self.action_module = ActionModule(self.action_expert, self.config, self.video_model, self.vlm_model, self.dtype, self.device)
         if bool(getattr(config, "activation_checkpointing", False)):
             logger.info(
-                "Activation checkpointing enabled for Motus layer blocks (use_reentrant=%s)",
+                "Activation checkpointing enabled for Motus layer blocks (use_reentrant=%s, interval=%s)",
                 bool(getattr(config, "activation_checkpointing_use_reentrant", False)),
+                int(getattr(config, "activation_checkpointing_interval", 1) or 1),
             )
-
-        # Initialize t distributions from config
-        time_dist_config = getattr(config, 'time_distribution', {}) or {}
-        model_config = {
-            'timestep_sample_method': time_dist_config.get('timestep_sample_method', 'logit_normal'),
-            'sigmoid_scale': time_dist_config.get('sigmoid_scale', 1.0),
-            'min_t': time_dist_config.get('min_t', 0.0),
-            'max_t': time_dist_config.get('max_t', 1.0)
-        }
 
         # Flow-Matching scheduler for training (video branch only)
         try:
@@ -851,8 +834,15 @@ class Motus(nn.Module):
             for module, attr, value in saved_states:
                 setattr(module, attr, value)
 
-    def _use_activation_checkpointing(self) -> bool:
-        return self.training and bool(getattr(self.config, "activation_checkpointing", False))
+    def _use_activation_checkpointing(self, layer_idx: int) -> bool:
+        if not (
+            self.training
+            and torch.is_grad_enabled()
+            and bool(getattr(self.config, "activation_checkpointing", False))
+        ):
+            return False
+        interval = max(1, int(getattr(self.config, "activation_checkpointing_interval", 1) or 1))
+        return (layer_idx % interval) == 0
 
     def _process_mot_layer(
         self,
@@ -911,7 +901,7 @@ class Motus(nn.Module):
             layer_und_tokens = self.und_module.process_ffn(layer_und_tokens, layer_idx)
             return layer_video_tokens, layer_action_tokens, layer_und_tokens
 
-        if self._use_activation_checkpointing():
+        if self._use_activation_checkpointing(layer_idx):
             return activation_checkpoint(
                 layer_forward,
                 video_tokens,
@@ -1416,6 +1406,189 @@ class Motus(nn.Module):
         }
         return action_loss, metrics
 
+    def _rolling_action_replan(
+        self,
+        first_frame: torch.Tensor,
+        state: torch.Tensor,
+        language_embeddings: Optional[List[torch.Tensor]],
+        vlm_inputs: Optional[Any],
+        prev_action_latent: Optional[torch.Tensor],
+        prev_chunk_stage: Optional[torch.Tensor],
+        multiplier: int,
+        pipeline_depth: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B = first_frame.shape[0]
+        base_len = int(self.config.action_chunk_size)
+        extended_len = base_len * multiplier
+
+        first_frame = first_frame.to(self.device, dtype=self.dtype)
+        state = state.to(self.device, dtype=self.dtype)
+        first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)
+        with torch.no_grad():
+            condition_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))
+
+        _, C_latent, _, H_latent, W_latent = condition_frame_latent.shape
+        total_latent_frames = 1 + self.config.num_video_frames // 4
+        video_latent = torch.randn(
+            (B, C_latent, total_latent_frames, H_latent, W_latent),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        video_latent[:, :, 0:1] = condition_frame_latent
+
+        action_shape = (B, extended_len, self.config.action_dim)
+        action_latent = torch.randn(action_shape, device=self.device, dtype=self.dtype)
+        chunk_stage = torch.zeros((B, multiplier), device=self.device, dtype=torch.long)
+
+        prev_action_valid = torch.is_tensor(prev_action_latent) and tuple(prev_action_latent.shape) == action_shape
+        prev_stage_valid = torch.is_tensor(prev_chunk_stage) and tuple(prev_chunk_stage.shape) == (B, multiplier)
+        if multiplier > 1 and prev_action_valid and prev_stage_valid:
+            prev_action = prev_action_latent.detach().to(device=self.device, dtype=self.dtype)
+            prev_stage = prev_chunk_stage.detach().to(device=self.device, dtype=torch.long).clamp(0, pipeline_depth)
+            roll_len = base_len * (multiplier - 1)
+            action_latent[:, :roll_len] = prev_action[:, base_len:]
+            chunk_stage[:, :multiplier - 1] = prev_stage[:, 1:]
+
+        target_stage = torch.arange(
+            pipeline_depth,
+            pipeline_depth - multiplier,
+            -1,
+            device=self.device,
+            dtype=torch.long,
+        ).clamp(0, pipeline_depth)
+        target_stage = target_stage.unsqueeze(0).expand(B, -1)
+        stages_to_run = int((target_stage - chunk_stage).clamp_min(0).max().item())
+        stages_to_run = max(0, min(pipeline_depth, stages_to_run))
+        processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
+
+        for video_step_idx in range(stages_to_run):
+            active_chunks = chunk_stage < target_stage
+            if not bool(active_chunks.any().item()):
+                break
+
+            chunk_t = (
+                (pipeline_depth - chunk_stage).clamp(0, pipeline_depth).to(self.dtype)
+                / float(pipeline_depth)
+            ) * 1000.0
+            video_t_value = (
+                float(pipeline_depth - min(video_step_idx, pipeline_depth))
+                / float(pipeline_depth)
+            ) * 1000.0
+            video_t = torch.full((B,), video_t_value, device=self.device, dtype=self.dtype)
+
+            video_tokens = self.video_module.prepare_input(video_latent.to(self.dtype))
+            action_tokens, action_layout = self._encode_extended_action_tokens(
+                state=state,
+                action_latent=action_latent,
+                base_action_len=base_len,
+                chunk_stage=chunk_stage,
+            )
+            und_tokens = self.und_module.extract_und_features(vlm_inputs)
+            attn_mask = self._build_action_chunk_causal_attn_mask(
+                video_token_len=video_tokens.shape[1],
+                action_token_len=action_tokens.shape[1],
+                und_token_len=und_tokens.shape[1],
+                layout=action_layout,
+                multiplier=multiplier,
+            )
+            action_t = self._extended_action_token_timesteps(chunk_t, action_layout)
+
+            with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
+                video_head_time_emb, video_adaln_params = self.video_module.get_time_embedding(
+                    video_t,
+                    video_tokens.shape[1],
+                )
+                action_head_time_emb, action_adaln_params = self.action_module.get_time_embedding(
+                    action_t,
+                    action_tokens.shape[1],
+                )
+                for layer_idx in range(self.config.num_layers):
+                    video_tokens, action_tokens, und_tokens = self._process_mot_layer(
+                        video_tokens,
+                        action_tokens,
+                        und_tokens,
+                        video_adaln_params,
+                        action_adaln_params,
+                        processed_t5_context,
+                        layer_idx,
+                        attn_mask=attn_mask,
+                    )
+
+                video_velocity = self.video_module.apply_output_head(video_tokens, video_head_time_emb)
+                action_velocity = self._decode_extended_action_velocity(
+                    action_tokens,
+                    action_head_time_emb,
+                    action_layout,
+                )
+
+            video_active = active_chunks.any(dim=1)
+            video_dt = video_active.to(self.dtype).view(B, 1, 1, 1, 1) * (-1.0 / float(pipeline_depth))
+            action_dt = (
+                active_chunks.to(self.dtype)
+                .unsqueeze(-1)
+                .expand(B, multiplier, base_len)
+                .reshape(B, extended_len)
+                .unsqueeze(-1)
+                * (-1.0 / float(pipeline_depth))
+            )
+            video_latent = video_latent + video_velocity * video_dt
+            video_latent[:, :, 0:1] = condition_frame_latent
+            action_latent = action_latent + action_velocity * action_dt
+            chunk_stage = torch.where(active_chunks, chunk_stage + 1, chunk_stage).clamp_max(pipeline_depth)
+
+        return action_latent, chunk_stage
+
+    def _rolling_action_distill_loss(
+        self,
+        rolling_condition_frames: torch.Tensor,
+        rolling_initial_states: torch.Tensor,
+        rolling_vlm_inputs: Optional[List[Any]],
+        language_embeddings: Optional[List[torch.Tensor]],
+        target_action_chunk: torch.Tensor,
+        multiplier: int,
+        pipeline_depth: int,
+    ) -> torch.Tensor:
+        if rolling_condition_frames is None or rolling_initial_states is None or rolling_vlm_inputs is None:
+            raise ValueError(
+                "rolling_action_distill is enabled, but rolling_condition_frames, "
+                "rolling_initial_states, or rolling_vlm_inputs is missing from the batch"
+            )
+        if rolling_condition_frames.shape[1] < multiplier or rolling_initial_states.shape[1] < multiplier:
+            raise ValueError(
+                f"rolling_action_distill requires {multiplier} rolling steps, got "
+                f"frames={rolling_condition_frames.shape[1]} states={rolling_initial_states.shape[1]}"
+            )
+        if not isinstance(rolling_vlm_inputs, list) or len(rolling_vlm_inputs) < multiplier:
+            raise ValueError(
+                f"rolling_action_distill requires {multiplier} step-wise VLM inputs, "
+                f"got {type(rolling_vlm_inputs).__name__}"
+            )
+
+        prev_action_latent = None
+        prev_chunk_stage = None
+        for step_idx in range(multiplier):
+            context = torch.enable_grad() if step_idx == multiplier - 1 else torch.no_grad()
+            with context:
+                action_latent, chunk_stage = self._rolling_action_replan(
+                    first_frame=rolling_condition_frames[:, step_idx],
+                    state=rolling_initial_states[:, step_idx],
+                    language_embeddings=language_embeddings,
+                    vlm_inputs=rolling_vlm_inputs[step_idx],
+                    prev_action_latent=prev_action_latent,
+                    prev_chunk_stage=prev_chunk_stage,
+                    multiplier=multiplier,
+                    pipeline_depth=pipeline_depth,
+                )
+            prev_action_latent = action_latent if step_idx == multiplier - 1 else action_latent.detach()
+            prev_chunk_stage = chunk_stage.detach()
+
+        predicted_current_chunk = prev_action_latent[:, : int(self.config.action_chunk_size)]
+        return torch.nn.functional.mse_loss(
+            predicted_current_chunk.float(),
+            target_action_chunk.to(self.device).float(),
+            reduction="mean",
+        )
+
     def extended_chunkwise_training_step(
         self,
         first_frame: torch.Tensor,
@@ -1424,6 +1597,9 @@ class Motus(nn.Module):
         actions: torch.Tensor,
         language_embeddings: Optional[List[torch.Tensor]] = None,
         vlm_inputs: Optional[List] = None,
+        rolling_condition_frames: Optional[torch.Tensor] = None,
+        rolling_initial_states: Optional[torch.Tensor] = None,
+        rolling_vlm_inputs: Optional[List[Any]] = None,
         return_dict: bool = True,
     ) -> Dict[str, torch.Tensor]:
         B = video_frames.shape[0]
@@ -1447,8 +1623,11 @@ class Motus(nn.Module):
             clean_full_latent = self.video_model.encode_video(full_video.to(self.dtype))
             condition_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))
 
-        video_t_embed = chunk_timesteps[:, 0]
-        sigma = chunk_sigmas[:, 0].view(B, 1, 1, 1, 1)
+        # The rolling action pipeline reinitializes video latents from noise at
+        # each replan. Keep the video branch's timestep tied to that fresh latent,
+        # instead of borrowing the partially-denoised action lane-0 stage.
+        video_t_embed = torch.full((B,), 1000.0, device=self.device, dtype=self.dtype)
+        sigma = torch.ones((B, 1, 1, 1, 1), device=self.device, dtype=self.dtype)
         video_noise = torch.randn_like(clean_full_latent, dtype=self.dtype)
         noisy_video_latent = clean_full_latent * (1 - sigma) + video_noise * sigma
         noisy_video_latent[:, :, 0:1] = condition_frame_latent
@@ -1516,9 +1695,23 @@ class Motus(nn.Module):
             self.config.video_loss_weight * video_loss +
             self.config.action_loss_weight * action_loss
         )
+        rolling_action_loss = None
+        if bool(getattr(self.config, "rolling_action_distill_enabled", False)):
+            clean_action_chunks = actions.reshape(B, multiplier, base_len, self.config.action_dim)
+            target_chunk_idx = min(multiplier - 1, clean_action_chunks.shape[1] - 1)
+            rolling_action_loss = self._rolling_action_distill_loss(
+                rolling_condition_frames=rolling_condition_frames,
+                rolling_initial_states=rolling_initial_states,
+                rolling_vlm_inputs=rolling_vlm_inputs,
+                language_embeddings=language_embeddings,
+                target_action_chunk=clean_action_chunks[:, target_chunk_idx].detach(),
+                multiplier=multiplier,
+                pipeline_depth=pipeline_depth,
+            )
+            total_loss = total_loss + float(self.config.rolling_action_distill_weight) * rolling_action_loss
 
         if return_dict:
-            return {
+            metrics = {
                 'total_loss': total_loss,
                 'video_loss': video_loss,
                 'action_loss': action_loss,
@@ -1532,6 +1725,13 @@ class Motus(nn.Module):
                 'action_timestep_mean': chunk_sigmas.float().mean().item(),
                 **chunk_metrics,
             }
+            if rolling_action_loss is not None:
+                metrics['rolling_action_distill_loss'] = rolling_action_loss
+                metrics['rolling_action_distill_weight'] = torch.tensor(
+                    float(self.config.rolling_action_distill_weight),
+                    device=self.device,
+                )
+            return metrics
 
     def forward(
         self,
@@ -1542,6 +1742,9 @@ class Motus(nn.Module):
         actions: Optional[torch.Tensor] = None,
         language_embeddings: Optional[Any] = None,
         vlm_inputs: Optional[Any] = None,
+        rolling_condition_frames: Optional[torch.Tensor] = None,
+        rolling_initial_states: Optional[torch.Tensor] = None,
+        rolling_vlm_inputs: Optional[List[Any]] = None,
         extended_chunkwise: bool = False,
         return_dict: bool = True,
         **kwargs,
@@ -1556,6 +1759,9 @@ class Motus(nn.Module):
                 actions=actions,
                 language_embeddings=language_embeddings,
                 vlm_inputs=vlm_inputs,
+                rolling_condition_frames=rolling_condition_frames,
+                rolling_initial_states=rolling_initial_states,
+                rolling_vlm_inputs=rolling_vlm_inputs,
                 return_dict=return_dict,
             )
         return self.training_step(
@@ -1691,325 +1897,6 @@ class Motus(nn.Module):
         predicted_actions = action_latent.float()  # [B, action_chunk_size, 14]
 
         return predicted_frames, predicted_actions
-
-    # Alternative inference (DPM++ solver)
-    '''
-    def inference_step(
-        self,
-        first_frame: torch.Tensor,
-        state: torch.Tensor = None,
-        num_inference_steps: int = 50,
-        language_embeddings: Optional[List[torch.Tensor]] = None,
-        vlm_inputs: Optional[List] = None,
-        solver: Optional[str] = None,
-        shift: Optional[float] = None,
-        seed: int = -1
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Joint inference for video and action prediction with dpm++ solver.
-        
-        Args:
-            first_frame: Initial frame [1, C, H, W] - batch size must be 1 for inference
-            state: Initial robot state [1, state_dim]
-            num_inference_steps: Number of denoising steps (default: 50)
-            language_embeddings: Pre-encoded T5 embeddings for WAN model
-            vlm_inputs: VLM inputs for understanding expert
-            solver: Solver type ("dpm++"), defaults to config.inference_solver
-            shift: Noise schedule shift, defaults to config.inference_shift
-            seed: Random seed for reproducible generation (-1 for random)
-            
-        Returns:
-            Tuple of (predicted_frames, predicted_actions)
-        """
-        # Move inputs to device
-        language_embeddings = [emb.to(self.device).to(self.dtype) for emb in language_embeddings]
-        state = state.to(self.device).to(self.dtype)
-        first_frame = first_frame.to(self.device).to(self.dtype)
-        
-        # Use config defaults if not specified
-        if solver is None:
-            solver = self.config.inference_solver
-        if shift is None:
-            shift = self.config.inference_shift
-
-        # Set random seed if specified
-        if seed >= 0:
-            generator = torch.Generator(device=self.device).manual_seed(seed)
-        else:
-            generator = None
-
-        # 1. Encode condition frame and initialize latents
-        first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)   # [1, C, 1, H, W]
-        with torch.no_grad():
-            condition_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))   # [1, 48, 1, H', W']
-
-        # Initialize video latent with noise - squeeze batch dimension for WAN format
-        _, C_latent, _, H_latent, W_latent = condition_frame_latent.shape
-        num_total_latent_frames = 1 + self.config.num_video_frames // 4
-        video_latent = torch.randn(
-            (C_latent, num_total_latent_frames, H_latent, W_latent), 
-            device=self.device, 
-            dtype=torch.float32,  # Use float32 for sampling numerical stability
-            generator=generator
-        )
-        # Set first frame as condition (teacher forcing)
-        video_latent[:, 0:1] = condition_frame_latent.squeeze(0).float()
-        
-        # Initialize action latent with noise
-        action_latent = torch.randn(
-            (1, self.config.action_chunk_size, self.config.action_dim), 
-            device=self.device, 
-            dtype=torch.float32,
-            generator=generator
-        )
-
-        # 2. Prepare understanding features and T5 context (compute once, reuse for all steps)
-        und_tokens = self.und_module.extract_und_features(vlm_inputs)
-        processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
-
-        # 3. Setup flow-matching schedulers (separate for video and action due to different tensor shapes)
-        if solver == "dpm++":
-            # Video scheduler
-            video_scheduler = FlowDPMSolverMultistepScheduler(
-                num_train_timesteps=self.config.num_train_timesteps,
-                shift=1.0,  # Base shift is 1.0
-                use_dynamic_shifting=False
-            )
-            # Action scheduler (independent instance)
-            action_scheduler = FlowDPMSolverMultistepScheduler(
-                num_train_timesteps=self.config.num_train_timesteps,
-                shift=1.0,
-                use_dynamic_shifting=False
-            )
-            # Get custom sigmas with shift parameter
-            sampling_sigmas = get_sampling_sigmas(num_inference_steps, shift)
-            timesteps, _ = retrieve_timesteps(
-                video_scheduler,
-                device=self.device,
-                sigmas=sampling_sigmas
-            )
-            # Set same timesteps for action scheduler
-            _, _ = retrieve_timesteps(
-                action_scheduler,
-                device=self.device,
-                sigmas=sampling_sigmas
-            )
-        else:
-            raise NotImplementedError(f"Solver '{solver}' not implemented. Currently only 'dpm++' is supported.")
-
-        # 4. Denoising loop with flow-matching solver
-        with torch.no_grad():
-            for step_idx, t in enumerate(timesteps):
-                # Prepare model inputs (add batch dimension back)
-                video_latent_input = video_latent.unsqueeze(0).to(self.dtype)  # [1, 48, T, H, W]
-                action_latent_input = action_latent.to(self.dtype)  # [1, chunk_size, action_dim]
-                
-                # Prepare tokens
-                video_tokens = self.video_module.prepare_input(video_latent_input)
-                state_tokens = state.unsqueeze(1)
-                registers = self.action_expert.registers.expand(1, -1, -1)
-                action_tokens = self.action_expert.input_encoder(state_tokens, action_latent_input, registers)
-                und_tokens = self.und_module.extract_und_features(vlm_inputs)
-                
-                # Model forward pass
-                with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
-                    # Time embeddings (t is in [0, 1000] from scheduler)
-                    video_t_scaled = t.expand(1).to(self.dtype)
-                    action_t_scaled = t.expand(1).to(self.dtype)
-                    video_head_time_emb, video_adaln_params = self.video_module.get_time_embedding(
-                        video_t_scaled, video_tokens.shape[1]
-                    )
-                    action_head_time_emb, action_adaln_params = self.action_module.get_time_embedding(
-                        action_t_scaled, action_tokens.shape[1]
-                    )
-
-                    # Process through all layers - trimodal joint denoising
-                    for layer_idx in range(self.config.num_layers):
-                        video_adaln_modulation = self.video_module.compute_adaln_modulation(video_adaln_params, layer_idx)
-                        action_adaln_modulation = self.action_module.compute_adaln_modulation(action_adaln_params, layer_idx)
-                        
-                        # Trimodal joint attention
-                        video_tokens, action_tokens, und_tokens = self.video_module.process_joint_attention(
-                            video_tokens, action_tokens, video_adaln_modulation, action_adaln_modulation, layer_idx, 
-                            self.action_expert.blocks[layer_idx],
-                            und_tokens, self.und_expert.blocks[layer_idx]
-                        )
-
-                        # WAN cross-attention with T5
-                        video_tokens = self.video_module.process_cross_attention(
-                            video_tokens, video_adaln_params, layer_idx, processed_t5_context
-                        )
-
-                        # FFNs for each modality
-                        video_tokens = self.video_module.process_ffn(video_tokens, video_adaln_modulation, layer_idx)
-                        action_tokens = self.action_module.process_ffn(action_tokens, action_adaln_modulation, layer_idx)
-                        und_tokens = self.und_module.process_ffn(und_tokens, layer_idx)
-
-                    # Prediction heads (predict velocity for flow-matching)
-                    video_pred = self.video_module.apply_output_head(video_tokens, video_head_time_emb)  # [1, 48, T, H, W]
-                    action_pred_full = self.action_expert.decoder(action_tokens, action_head_time_emb)
-                    action_pred = action_pred_full[:, 1:-self.action_expert.config.num_registers, :]  # [1, chunk_size, action_dim]
-
-                # Update latents using separate schedulers (video and action have different tensor shapes)
-                # Video: squeeze batch dim, call video_scheduler, squeeze back
-                video_latent = video_scheduler.step(
-                    video_pred.squeeze(0).unsqueeze(0),  # Add dummy batch dim for scheduler
-                    t,
-                    video_latent.unsqueeze(0),  # Add dummy batch dim for scheduler
-                    return_dict=False,
-                    generator=generator
-                )[0].squeeze(0)  # Remove dummy batch dim
-                
-                # Action: directly use 3D tensor [1, chunk_size, action_dim] with action_scheduler
-                # DPM-Solver doesn't require specific dimensions, just consistency
-                action_latent = action_scheduler.step(
-                    action_pred,  # [1, chunk_size, action_dim]
-                    t,
-                    action_latent,  # [1, chunk_size, action_dim]
-                    return_dict=False,
-                    generator=generator
-                )[0]
-                
-                # Teacher forcing: keep first frame as condition
-                video_latent[:, 0:1] = condition_frame_latent.squeeze(0).float()
-
-        # 5. Decode final outputs
-        with torch.no_grad():
-            decoded_frames = self.video_model.decode_video(video_latent.unsqueeze(0).to(self.dtype))  # Add batch dim back
-            predicted_frames = decoded_frames[:, :, 1:]  # Skip first frame (condition)
-            predicted_frames = (predicted_frames + 1.0) / 2.0  # [-1,1] to [0,1]
-            predicted_frames = torch.clamp(predicted_frames, 0, 1).float()
-
-        predicted_actions = action_latent.float()  # [1, chunk_size, action_dim]
-
-        return predicted_frames, predicted_actions
-    '''
-
-    # Alternative inference (UniPC solver)
-    '''
-    def inference_step(
-        self,
-        first_frame: torch.Tensor,
-        state: torch.Tensor = None,
-        num_inference_steps: int = 50,
-        language_embeddings: Optional[List[torch.Tensor]] = None,
-        vlm_inputs: Optional[List] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Joint inference for video and action prediction.
-        
-        Args:
-            first_frame: Initial frame [B, C, H, W]
-            texts: Text instructions for VLM
-            images: Optional images for VLM
-            state: Initial robot state [B, state_dim]
-            num_inference_steps: Number of denoising steps
-            language_embeddings: Pre-encoded T5 embeddings for WAN model
-            
-        Returns:
-            Tuple of (predicted_frames, predicted_actions)
-        """
-        B = first_frame.shape[0]
-
-        language_embeddings = [emb.to(self.device).to(self.dtype) for emb in language_embeddings]
-        if self.config.training_mode != 'pretrain':
-            state = state.to(self.device).to(self.dtype)
-        first_frame = first_frame.to(self.device).to(self.dtype)
-
-        # 1. Video/Action latents init
-        # Condition frame encode
-        first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)   # [0,1] -> [-1,1], [B, C, 1, H, W]
-        with torch.no_grad():
-            condition_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))   # [B, C', 1, H', W']
-
-        # Init video/action latents
-        B, C_latent, f_latent, H_latent, W_latent = condition_frame_latent.shape
-        num_total_latent_frames = 1 + self.config.num_video_frames // 4
-        video_latent = torch.randn((B, C_latent, num_total_latent_frames, H_latent, W_latent), device=self.device, dtype=self.dtype)
-        video_latent[:, :, 0:1] = condition_frame_latent
-        action_shape = (B, self.config.action_chunk_size, self.config.action_dim)
-        action_latent = torch.randn(action_shape, device=self.device, dtype=self.dtype)
-
-        # 2. Understanding Expert features and T5 context
-        # Extract understanding features from VLM
-        und_tokens = self.und_module.extract_und_features(vlm_inputs)
-
-        # T5 preprocess
-        processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
-
-        # 3. Denoising loop: use FlowUniPCMultistepScheduler for video and action latents
-        scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=1.0, use_dynamic_shifting=False)
-        scheduler.set_timesteps(num_inference_steps, device=self.device, shift=1.0)
-        # Use a separate scheduler instance for the action branch to avoid shared internal state
-        action_scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=1.0, use_dynamic_shifting=False)
-        action_scheduler.set_timesteps(num_inference_steps, device=self.device, shift=1.0)
-        timesteps = scheduler.timesteps  # int64 on device
-
-        for t in timesteps:
-            # Tokens (with optional registers)
-            video_tokens = self.video_module.prepare_input(video_latent.to(self.dtype))
-            if self.action_expert.config.num_registers > 0 and self.action_expert.registers is not None:
-                registers = self.action_expert.registers.expand(B, -1, -1)
-            else:
-                registers = None
-            if self.config.training_mode == 'pretrain':
-                action_tokens = self.action_expert.input_encoder(None, action_latent, registers)
-            else:
-                state_tokens = state.unsqueeze(1).to(self.dtype)
-                action_tokens = self.action_expert.input_encoder(state_tokens, action_latent, registers)
-
-            # Re-extract understanding features per step (keeps alignment with current pipeline)
-            und_tokens = self.und_module.extract_und_features(vlm_inputs)
-            
-            with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
-                # Time embeddings: use the current discrete t (0..num_train_timesteps)
-                t_scalar = t.to(self.dtype).repeat(B)
-                video_head_time_emb, video_adaln_params = self.video_module.get_time_embedding(t_scalar, video_tokens.shape[1])
-                action_head_time_emb, action_adaln_params = self.action_module.get_time_embedding(t_scalar, action_tokens.shape[1])
-
-                # Layer stack for joint denoising
-                for layer_idx in range(self.config.num_layers):
-                    video_adaln_modulation = self.video_module.compute_adaln_modulation(video_adaln_params, layer_idx)
-                    action_adaln_modulation = self.action_module.compute_adaln_modulation(action_adaln_params, layer_idx)
-                    video_tokens, action_tokens, und_tokens = self.video_module.process_joint_attention(
-                        video_tokens, action_tokens, video_adaln_modulation, action_adaln_modulation, layer_idx, 
-                        self.action_expert.blocks[layer_idx],
-                        und_tokens, self.und_expert.blocks[layer_idx]
-                    )
-                    # WAN cross
-                    video_tokens = self.video_module.process_cross_attention(
-                        video_tokens, video_adaln_params, layer_idx, processed_t5_context
-                    )
-                    video_tokens = self.video_module.process_ffn(video_tokens, video_adaln_modulation, layer_idx)
-                    action_tokens = self.action_module.process_ffn(action_tokens, action_adaln_modulation, layer_idx)
-                    und_tokens = self.und_module.process_ffn(und_tokens, layer_idx)
-
-                # Predict velocities (video and action) and take scheduler steps
-                video_velocity = self.video_module.apply_output_head(video_tokens, video_head_time_emb)
-                action_velocity_full = self.action_expert.decoder(action_tokens, action_head_time_emb)
-                up_len = action_velocity_full.shape[1] - self.action_expert.config.num_registers
-                if self.config.training_mode == 'pretrain':
-                    action_velocity = action_velocity_full[:, :up_len, :]
-                else:
-                    action_velocity = action_velocity_full[:, 1:up_len, :]
-
-                # Scheduler steps
-                video_latent = scheduler.step(model_output=video_velocity, timestep=t, sample=video_latent, return_dict=False)[0]
-                # Teacher Forcing on the first frame (video)
-                video_latent[:, :, 0:1] = condition_frame_latent
-                action_latent = action_scheduler.step(model_output=action_velocity, timestep=t, sample=action_latent, return_dict=False)[0]
-
-        # 4. Decode outputs
-        with torch.no_grad():
-            decoded_frames = self.video_model.decode_video(video_latent)
-            predicted_frames = decoded_frames[:, :, 1:]  # Skip first frame (condition)
-            predicted_frames = (predicted_frames + 1.0) / 2.0  # [-1,1] to [0,1]
-            predicted_frames = torch.clamp(predicted_frames, 0, 1).float()
-
-        predicted_actions = action_latent.float()  # [B, action_chunk_size, 14]
-
-        return predicted_frames, predicted_actions
-    '''
 
 
 def test_motus():

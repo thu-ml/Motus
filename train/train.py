@@ -37,7 +37,11 @@ sys.path.append(str(Path(__file__).parent.parent))
 from models.motus import Motus, MotusConfig
 from data.dataset import create_dataset, collate_fn
 from utils.scheduler import create_scheduler
-from sample import evaluate_model, log_evaluation_metrics
+try:
+    from sample import evaluate_model, log_evaluation_metrics
+except ModuleNotFoundError:
+    evaluate_model = None
+    log_evaluation_metrics = None
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +98,6 @@ def get_lora_save_config(config: Optional[Any]) -> Dict[str, Any]:
         "common": cfg_dict.get("common", {}),
         "action_expert": model_cfg.get("action_expert", {}),
         "und_expert": model_cfg.get("und_expert", {}),
-        "time_distribution": model_cfg.get("time_distribution", {}),
         "inference": model_cfg.get("inference", {}),
         "loss_weights": model_cfg.get("loss_weights", {}),
         "lora": model_cfg.get("lora", {}),
@@ -265,7 +268,6 @@ class UniDiffuserTrainer:
                 "common": common,
                 "action_expert": model.get("action_expert", {}),
                 "und_expert": model.get("und_expert", {}),
-                "time_distribution": model.get("time_distribution", {}),
                 "ema": model.get("ema", {}),
                 "lora": model.get("lora", {}),
                 "extended_chunkwise_finetune": model.get("extended_chunkwise_finetune", {}),
@@ -393,6 +395,15 @@ class UniDiffuserTrainer:
                     "extended_action_sequence. Check dataset horizon and collate settings."
                 )
             extended_actions = batch["extended_action_sequence"].to(self.device, dtype=self.dtype)
+            rolling_condition_frames = batch.get("rolling_condition_frames")
+            if rolling_condition_frames is not None:
+                rolling_condition_frames = rolling_condition_frames.to(self.device, dtype=self.dtype)
+            rolling_initial_states = batch.get("rolling_initial_states")
+            if rolling_initial_states is not None:
+                rolling_initial_states = rolling_initial_states.to(self.device, dtype=self.dtype)
+            rolling_vlm_inputs = batch.get("rolling_vlm_inputs")
+            if rolling_vlm_inputs is not None:
+                rolling_vlm_inputs = move_nested_to_device(rolling_vlm_inputs, self.device)
             loss_dict = self.model(
                 first_frame=first_frame,
                 video_frames=video_frames,
@@ -400,6 +411,9 @@ class UniDiffuserTrainer:
                 actions=extended_actions,
                 language_embeddings=language_embeddings,
                 vlm_inputs=vlm_inputs,
+                rolling_condition_frames=rolling_condition_frames,
+                rolling_initial_states=rolling_initial_states,
+                rolling_vlm_inputs=rolling_vlm_inputs,
                 extended_chunkwise=True,
                 return_dict=True,
             )
@@ -523,15 +537,11 @@ class UniDiffuserTrainer:
                 lr_main = lrs[0] if len(lrs) > 0 else 0.0
                 lr_wan = lrs[1] if len(lrs) > 1 else lr_main
                 
-                video_metric = metrics.get('video_loss', metrics.get('video_distill_loss', 0.0))
-                action_metric = metrics.get('action_loss', metrics.get('action_distill_loss', 0.0))
+                video_metric = metrics.get('video_loss', 0.0)
+                action_metric = metrics.get('action_loss', 0.0)
                 extra_metrics = []
-                if 'velocity_distill_loss' in metrics:
-                    extra_metrics.append(f"Velocity: {metrics['velocity_distill_loss']:.4f}")
-                if 'intermediate_distill_loss' in metrics:
-                    extra_metrics.append(f"Intermediate: {metrics['intermediate_distill_loss']:.4f}")
-                if 'direct_preservation_loss' in metrics:
-                    extra_metrics.append(f"Direct: {metrics['direct_preservation_loss']:.4f}")
+                if 'rolling_action_distill_loss' in metrics:
+                    extra_metrics.append(f"RollingAction: {metrics['rolling_action_distill_loss']:.4f}")
                 extra_metric_str = f", {'; '.join(extra_metrics)}" if extra_metrics else ""
                 log_str = (
                     f"Step {self.global_step}/{max_steps}, "
@@ -563,6 +573,11 @@ class UniDiffuserTrainer:
 
             # Validation: rank0-only local eval; then synchronize all processes
             if self.global_step % val_interval == 0 and self.val_dataloader is not None:
+                if evaluate_model is None or log_evaluation_metrics is None:
+                    raise ModuleNotFoundError(
+                        "Validation requested, but sample.evaluate_model/log_evaluation_metrics "
+                        "could not be imported."
+                    )
                 if self.rank == 0:
                     val_metrics = evaluate_model(
                         self.model, self.val_dataloader, self.accelerator, self.config,
@@ -601,7 +616,6 @@ def _get_extended_chunkwise_config(config: OmegaConf):
 
 def create_model(config: OmegaConf) -> Motus:
     """Create UniDiffuser model from config."""
-    lora_cfg = _get_lora_config(config)
     extended_cfg = _get_extended_chunkwise_config(config)
     chunk_loss_weights = list(extended_cfg.get('chunk_loss_weights', [1.0, 0.7, 0.5]))
     while len(chunk_loss_weights) < 3:
@@ -633,17 +647,11 @@ def create_model(config: OmegaConf) -> Motus:
         batch_size=config.training.batch_size,
         activation_checkpointing=bool(config.model.get('activation_checkpointing', False)),
         activation_checkpointing_use_reentrant=bool(config.model.get('activation_checkpointing_use_reentrant', False)),
+        activation_checkpointing_interval=int(config.model.get('activation_checkpointing_interval', 1) or 1),
         video_loss_weight=config.model.loss_weights.video_loss_weight,
         action_loss_weight=config.model.loss_weights.action_loss_weight,
         training_mode=getattr(config, 'training_mode', 'finetune'),
         load_pretrained_backbones=getattr(config.model, 'load_pretrained_backbones', None),
-        lora_enabled=bool(lora_cfg.get('enabled', False)),
-        lora_rank=int(lora_cfg.get('rank', 8)),
-        lora_alpha=float(lora_cfg.get('alpha', 16.0)),
-        lora_dropout=float(lora_cfg.get('dropout', 0.0)),
-        lora_target_linear=bool(lora_cfg.get('target_linear', True)),
-        lora_target_qkv=bool(lora_cfg.get('target_qkv', True)),
-        time_distribution=dict(config.model.get('time_distribution', {})),
         extended_chunkwise_enabled=bool(extended_cfg.get('enabled', False)),
         extended_chunkwise_multiplier=int(extended_cfg.get('multiplier', 3)),
         extended_chunkwise_pipeline_depth=int(extended_cfg.get('pipeline_depth', 3)),
@@ -654,6 +662,8 @@ def create_model(config: OmegaConf) -> Motus:
         extended_chunkwise_chunk_weight_2=float(chunk_loss_weights[2]),
         extended_chunkwise_constant_weight=float(extended_cfg.get('temporally_constant_weight', 0.2)),
         extended_chunkwise_chunkwise_weight=float(extended_cfg.get('chunk_wise_weight', 0.8)),
+        rolling_action_distill_enabled=bool(extended_cfg.get('rolling_action_distill_enabled', False)),
+        rolling_action_distill_weight=float(extended_cfg.get('rolling_action_distill_weight', 0.0)),
     )
     return Motus(model_config)
 

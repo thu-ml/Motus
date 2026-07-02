@@ -90,6 +90,7 @@ class RobotWinTaskDataset(data.Dataset):
         # VLM processing parameters
         vlm_checkpoint_path: Optional[str] = None,  # Path to VLM model
         extended_action_multiplier: int = 1,
+        include_rolling_condition: bool = False,
     ):
         """
         Initialize RobotWin dataset with flexible sampling.
@@ -132,6 +133,7 @@ class RobotWinTaskDataset(data.Dataset):
         self.image_aug = image_aug
         self.extended_action_multiplier = max(1, int(extended_action_multiplier or 1))
         self.extended_action_chunk_size = self.action_chunk_size * self.extended_action_multiplier
+        self.include_rolling_condition = bool(include_rolling_condition)
         
         # Validate parameters
         if task_mode == "single" and not task_name:
@@ -160,6 +162,7 @@ class RobotWinTaskDataset(data.Dataset):
         logger.info(f"  Video frames to predict: {num_video_frames}")
         logger.info(f"  Extended action multiplier: {self.extended_action_multiplier}")
         logger.info(f"  Extended action chunk size: {self.extended_action_chunk_size}")
+        logger.info(f"  Rolling condition samples: {self.include_rolling_condition}")
         logger.info(f"  Total episodes: {self.total_episodes}")
         
         # Initialize VLM processor for complete VLM processing in dataset
@@ -358,6 +361,14 @@ class RobotWinTaskDataset(data.Dataset):
         # initial_state = self._normalize_actions(initial_state.unsqueeze(0)).squeeze(0)  # Normalize state same way as actions
         
         return initial_state, action_sequence
+
+    def _load_robot_states(self, qpos_path: str, state_indices: List[int]) -> torch.Tensor:
+        qpos_data = torch.load(qpos_path, map_location='cpu')
+        states = []
+        for idx in state_indices:
+            safe_idx = min(max(int(idx), 0), len(qpos_data) - 1)
+            states.append(qpos_data[safe_idx].float())
+        return torch.stack(states).float()
 
     def _load_language_embedding(self, lang_path: str) -> tuple[torch.Tensor, int]:
         """Load pre-encoded language embedding and return the selected index."""
@@ -567,6 +578,39 @@ class RobotWinTaskDataset(data.Dataset):
                     first_frame_pil = tensor_to_pil(first_frame.squeeze(0))
                     vlm_inputs = preprocess_vlm_messages(text_instruction, first_frame_pil, self.vlm_processor)
 
+                rolling_condition_frames = None
+                rolling_initial_states = None
+                rolling_condition_indices = None
+                rolling_vlm_inputs = None
+                if self.include_rolling_condition and self.extended_action_multiplier > 1:
+                    rolling_stride = self.action_chunk_size * self.global_downsample_rate
+                    rolling_condition_indices_list = [
+                        min(condition_frame_idx + step_idx * rolling_stride, total_frames - 1)
+                        for step_idx in range(self.extended_action_multiplier)
+                    ]
+                    rolling_condition_frames = load_video_frames(
+                        episode_data['video_path'],
+                        rolling_condition_indices_list,
+                        self.video_size,
+                    )
+                    rolling_initial_states = self._load_robot_states(
+                        episode_data['qpos_path'],
+                        rolling_condition_indices_list,
+                    )
+                    rolling_condition_indices = torch.tensor(
+                        rolling_condition_indices_list,
+                        dtype=torch.long,
+                    )
+                    if self.vlm_processor is not None:
+                        rolling_vlm_inputs = [
+                            preprocess_vlm_messages(
+                                text_instruction,
+                                tensor_to_pil(rolling_condition_frames[step_idx]),
+                                self.vlm_processor,
+                            )
+                            for step_idx in range(rolling_condition_frames.shape[0])
+                        ]
+
                 sample = {
                     'first_frame': first_frame.squeeze(0),
                     'video_frames': video_frames,
@@ -583,6 +627,15 @@ class RobotWinTaskDataset(data.Dataset):
                         {
                             'extended_action_sequence': extended_action_sequence,
                             'extended_action_indices': torch.tensor(extended_action_indices, dtype=torch.long),
+                        }
+                    )
+                if rolling_condition_frames is not None:
+                    sample.update(
+                        {
+                            'rolling_condition_frames': rolling_condition_frames,
+                            'rolling_initial_states': rolling_initial_states,
+                            'rolling_condition_indices': rolling_condition_indices,
+                            'rolling_vlm_inputs': rolling_vlm_inputs,
                         }
                     )
 

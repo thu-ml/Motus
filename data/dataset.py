@@ -52,6 +52,9 @@ def create_dataset(config: OmegaConf, val: bool = False):
         extended_chunkwise = getattr(config.model, 'extended_chunkwise_finetune', {})
         if bool(extended_chunkwise.get('enabled', False)):
             params['extended_action_multiplier'] = int(extended_chunkwise.get('multiplier', 3))
+            params['include_rolling_condition'] = bool(
+                extended_chunkwise.get('rolling_action_distill_enabled', False)
+            )
         
         # Add VLM checkpoint path
         if hasattr(config.model, 'vlm') and hasattr(config.model.vlm, 'checkpoint_path'):
@@ -293,6 +296,15 @@ def _process_language_embeddings_batch(language_embeddings: List[torch.Tensor], 
     return torch.stack(padded_embeddings, dim=0)
 
 
+def _process_rolling_vlm_inputs_batch(rolling_vlm_inputs: List[List[Dict[str, Any]]]) -> List[Dict[str, torch.Tensor]]:
+    steps = len(rolling_vlm_inputs[0])
+    batched_steps = []
+    for step_idx in range(steps):
+        step_inputs = [sample_inputs[step_idx] for sample_inputs in rolling_vlm_inputs]
+        batched_steps.append(_process_vlm_inputs_batch(step_inputs))
+    return batched_steps
+
+
 def collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
     """
     Universal collate function for all datasets.
@@ -342,6 +354,15 @@ def collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]
     if all(('extended_action_sequence' in sample and sample['extended_action_sequence'] is not None) for sample in batch):
         result['extended_action_sequence'] = torch.stack([sample['extended_action_sequence'] for sample in batch])
         result['extended_action_indices'] = torch.stack([sample['extended_action_indices'] for sample in batch])
+
+    if all(('rolling_condition_frames' in sample and sample['rolling_condition_frames'] is not None) for sample in batch):
+        result['rolling_condition_frames'] = torch.stack([sample['rolling_condition_frames'] for sample in batch])
+        result['rolling_initial_states'] = torch.stack([sample['rolling_initial_states'] for sample in batch])
+        result['rolling_condition_indices'] = torch.stack([sample['rolling_condition_indices'] for sample in batch])
+
+    rolling_vlm_inputs = [sample.get('rolling_vlm_inputs') for sample in batch]
+    if rolling_vlm_inputs and all(vlm_steps is not None for vlm_steps in rolling_vlm_inputs):
+        result['rolling_vlm_inputs'] = _process_rolling_vlm_inputs_batch(rolling_vlm_inputs)
 
     if all(('condition_frame_idx' in sample and sample['condition_frame_idx'] is not None) for sample in batch):
         result['condition_frame_idx'] = torch.stack([sample['condition_frame_idx'] for sample in batch])

@@ -404,6 +404,9 @@ class UniDiffuserTrainer:
             rolling_vlm_inputs = batch.get("rolling_vlm_inputs")
             if rolling_vlm_inputs is not None:
                 rolling_vlm_inputs = move_nested_to_device(rolling_vlm_inputs, self.device)
+            rolling_target_action_chunks = batch.get("rolling_target_action_chunks")
+            if rolling_target_action_chunks is not None:
+                rolling_target_action_chunks = rolling_target_action_chunks.to(self.device, dtype=self.dtype)
             loss_dict = self.model(
                 first_frame=first_frame,
                 video_frames=video_frames,
@@ -414,6 +417,7 @@ class UniDiffuserTrainer:
                 rolling_condition_frames=rolling_condition_frames,
                 rolling_initial_states=rolling_initial_states,
                 rolling_vlm_inputs=rolling_vlm_inputs,
+                rolling_target_action_chunks=rolling_target_action_chunks,
                 extended_chunkwise=True,
                 return_dict=True,
             )
@@ -542,6 +546,8 @@ class UniDiffuserTrainer:
                 extra_metrics = []
                 if 'rolling_action_distill_loss' in metrics:
                     extra_metrics.append(f"RollingAction: {metrics['rolling_action_distill_loss']:.4f}")
+                if 'rolled_state_fm_loss' in metrics:
+                    extra_metrics.append(f"RolledStateFM: {metrics['rolled_state_fm_loss']:.4f}")
                 extra_metric_str = f", {'; '.join(extra_metrics)}" if extra_metrics else ""
                 log_str = (
                     f"Step {self.global_step}/{max_steps}, "
@@ -664,6 +670,8 @@ def create_model(config: OmegaConf) -> Motus:
         extended_chunkwise_chunkwise_weight=float(extended_cfg.get('chunk_wise_weight', 0.8)),
         rolling_action_distill_enabled=bool(extended_cfg.get('rolling_action_distill_enabled', False)),
         rolling_action_distill_weight=float(extended_cfg.get('rolling_action_distill_weight', 0.0)),
+        rolled_state_fm_enabled=bool(extended_cfg.get('rolled_state_fm_enabled', False)),
+        rolled_state_fm_weight=float(extended_cfg.get('rolled_state_fm_weight', 0.0)),
     )
     return Motus(model_config)
 

@@ -91,6 +91,7 @@ class RobotWinTaskDataset(data.Dataset):
         vlm_checkpoint_path: Optional[str] = None,  # Path to VLM model
         extended_action_multiplier: int = 1,
         include_rolling_condition: bool = False,
+        include_rolling_target_actions: bool = False,
     ):
         """
         Initialize RobotWin dataset with flexible sampling.
@@ -134,6 +135,7 @@ class RobotWinTaskDataset(data.Dataset):
         self.extended_action_multiplier = max(1, int(extended_action_multiplier or 1))
         self.extended_action_chunk_size = self.action_chunk_size * self.extended_action_multiplier
         self.include_rolling_condition = bool(include_rolling_condition)
+        self.include_rolling_target_actions = bool(include_rolling_target_actions)
         
         # Validate parameters
         if task_mode == "single" and not task_name:
@@ -163,6 +165,7 @@ class RobotWinTaskDataset(data.Dataset):
         logger.info(f"  Extended action multiplier: {self.extended_action_multiplier}")
         logger.info(f"  Extended action chunk size: {self.extended_action_chunk_size}")
         logger.info(f"  Rolling condition samples: {self.include_rolling_condition}")
+        logger.info(f"  Rolling target action chunks: {self.include_rolling_target_actions}")
         logger.info(f"  Total episodes: {self.total_episodes}")
         
         # Initialize VLM processor for complete VLM processing in dataset
@@ -450,7 +453,10 @@ class RobotWinTaskDataset(data.Dataset):
             - action_indices: List of action frame indices to predict
         """
         # Ensure the sampled condition frame can provide the full extended action horizon.
-        physical_chunk_size = self.extended_action_chunk_size * self.global_downsample_rate
+        required_action_steps = self.extended_action_chunk_size
+        if self.include_rolling_target_actions and self.extended_action_multiplier > 1:
+            required_action_steps = self.action_chunk_size * (2 * self.extended_action_multiplier - 1)
+        physical_chunk_size = required_action_steps * self.global_downsample_rate
         
         # Sample condition frame directly in physical space
         # Ensure the last action doesn't exceed total_frames - 1
@@ -582,6 +588,8 @@ class RobotWinTaskDataset(data.Dataset):
                 rolling_initial_states = None
                 rolling_condition_indices = None
                 rolling_vlm_inputs = None
+                rolling_target_action_chunks = None
+                rolling_target_action_indices = None
                 if self.include_rolling_condition and self.extended_action_multiplier > 1:
                     rolling_stride = self.action_chunk_size * self.global_downsample_rate
                     rolling_condition_indices_list = [
@@ -611,6 +619,37 @@ class RobotWinTaskDataset(data.Dataset):
                             for step_idx in range(rolling_condition_frames.shape[0])
                         ]
 
+                if self.include_rolling_target_actions and self.extended_action_multiplier > 1:
+                    rolling_target_len = self.action_chunk_size * (2 * self.extended_action_multiplier - 1)
+                    rolling_target_action_indices_list = [
+                        min(
+                            condition_frame_idx + (action_idx + 1) * self.global_downsample_rate,
+                            total_frames - 1,
+                        )
+                        for action_idx in range(rolling_target_len)
+                    ]
+                    _, rolling_target_action_sequence = self._load_robot_data(
+                        episode_data['qpos_path'],
+                        rolling_target_action_indices_list,
+                        condition_frame_idx,
+                    )
+                    rolling_target_action_chunks = []
+                    for step_idx in range(self.extended_action_multiplier):
+                        start = step_idx * self.action_chunk_size
+                        end = start + self.extended_action_chunk_size
+                        rolling_target_action_chunks.append(
+                            rolling_target_action_sequence[start:end].reshape(
+                                self.extended_action_multiplier,
+                                self.action_chunk_size,
+                                -1,
+                            )
+                        )
+                    rolling_target_action_chunks = torch.stack(rolling_target_action_chunks).float()
+                    rolling_target_action_indices = torch.tensor(
+                        rolling_target_action_indices_list,
+                        dtype=torch.long,
+                    )
+
                 sample = {
                     'first_frame': first_frame.squeeze(0),
                     'video_frames': video_frames,
@@ -636,6 +675,13 @@ class RobotWinTaskDataset(data.Dataset):
                             'rolling_initial_states': rolling_initial_states,
                             'rolling_condition_indices': rolling_condition_indices,
                             'rolling_vlm_inputs': rolling_vlm_inputs,
+                        }
+                    )
+                if rolling_target_action_chunks is not None:
+                    sample.update(
+                        {
+                            'rolling_target_action_chunks': rolling_target_action_chunks,
+                            'rolling_target_action_indices': rolling_target_action_indices,
                         }
                     )
 

@@ -54,6 +54,10 @@ def create_dataset(config: OmegaConf, val: bool = False):
             params['extended_action_multiplier'] = int(extended_chunkwise.get('multiplier', 3))
             params['include_rolling_condition'] = bool(
                 extended_chunkwise.get('rolling_action_distill_enabled', False)
+                or extended_chunkwise.get('rolled_state_fm_enabled', False)
+            )
+            params['include_rolling_target_actions'] = bool(
+                extended_chunkwise.get('rolled_state_fm_enabled', False)
             )
         
         # Add VLM checkpoint path
@@ -359,6 +363,10 @@ def collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]
         result['rolling_condition_frames'] = torch.stack([sample['rolling_condition_frames'] for sample in batch])
         result['rolling_initial_states'] = torch.stack([sample['rolling_initial_states'] for sample in batch])
         result['rolling_condition_indices'] = torch.stack([sample['rolling_condition_indices'] for sample in batch])
+
+    if all(('rolling_target_action_chunks' in sample and sample['rolling_target_action_chunks'] is not None) for sample in batch):
+        result['rolling_target_action_chunks'] = torch.stack([sample['rolling_target_action_chunks'] for sample in batch])
+        result['rolling_target_action_indices'] = torch.stack([sample['rolling_target_action_indices'] for sample in batch])
 
     rolling_vlm_inputs = [sample.get('rolling_vlm_inputs') for sample in batch]
     if rolling_vlm_inputs and all(vlm_steps is not None for vlm_steps in rolling_vlm_inputs):

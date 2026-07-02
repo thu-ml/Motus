@@ -44,7 +44,7 @@ model:
   inference:
     num_inference_timesteps: 3
   loss_weights:
-    video_loss_weight: 1.0
+    video_loss_weight: 0.1
     action_loss_weight: 1.0
   lora:
     enabled: true
@@ -62,8 +62,8 @@ model:
     temporally_constant_weight: 0.2
     chunk_wise_weight: 0.8
     chunk_loss_weights: [1.0, 0.7, 0.5]
-    rolling_action_distill_enabled: true
-    rolling_action_distill_weight: 0.2
+    rolled_state_fm_enabled: true
+    rolled_state_fm_weight: 0.5
   ema:
     enabled: false
     update_after_step: 0

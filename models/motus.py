@@ -96,6 +96,8 @@ class MotusConfig:
     extended_chunkwise_chunkwise_weight: float = 0.8
     rolling_action_distill_enabled: bool = False
     rolling_action_distill_weight: float = 0.0
+    rolled_state_fm_enabled: bool = False
+    rolled_state_fm_weight: float = 0.0
 
     def __post_init__(self):
         """Calculate derived parameters."""
@@ -1406,17 +1408,30 @@ class Motus(nn.Module):
         }
         return action_loss, metrics
 
-    def _rolling_action_replan(
+    def _rolling_target_stage(
+        self,
+        B: int,
+        multiplier: int,
+        pipeline_depth: int,
+    ) -> torch.Tensor:
+        target_stage = torch.arange(
+            pipeline_depth,
+            pipeline_depth - multiplier,
+            -1,
+            device=self.device,
+            dtype=torch.long,
+        ).clamp(0, pipeline_depth)
+        return target_stage.unsqueeze(0).expand(B, -1)
+
+    def _init_rolling_replan_state(
         self,
         first_frame: torch.Tensor,
         state: torch.Tensor,
-        language_embeddings: Optional[List[torch.Tensor]],
-        vlm_inputs: Optional[Any],
         prev_action_latent: Optional[torch.Tensor],
         prev_chunk_stage: Optional[torch.Tensor],
         multiplier: int,
         pipeline_depth: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B = first_frame.shape[0]
         base_len = int(self.config.action_chunk_size)
         extended_len = base_len * multiplier
@@ -1449,14 +1464,106 @@ class Motus(nn.Module):
             action_latent[:, :roll_len] = prev_action[:, base_len:]
             chunk_stage[:, :multiplier - 1] = prev_stage[:, 1:]
 
-        target_stage = torch.arange(
-            pipeline_depth,
-            pipeline_depth - multiplier,
-            -1,
-            device=self.device,
-            dtype=torch.long,
-        ).clamp(0, pipeline_depth)
-        target_stage = target_stage.unsqueeze(0).expand(B, -1)
+        return condition_frame_latent, video_latent, action_latent, chunk_stage
+
+    def _rolling_action_model_step(
+        self,
+        state: torch.Tensor,
+        language_embeddings: Optional[List[torch.Tensor]],
+        vlm_inputs: Optional[Any],
+        video_latent: torch.Tensor,
+        action_latent: torch.Tensor,
+        chunk_stage: torch.Tensor,
+        multiplier: int,
+        pipeline_depth: int,
+        video_step_idx: int,
+        processed_t5_context: Optional[List[torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B = action_latent.shape[0]
+        base_len = int(self.config.action_chunk_size)
+        chunk_t = (
+            (pipeline_depth - chunk_stage).clamp(0, pipeline_depth).to(self.dtype)
+            / float(pipeline_depth)
+        ) * 1000.0
+        video_t_value = (
+            float(pipeline_depth - min(video_step_idx, pipeline_depth))
+            / float(pipeline_depth)
+        ) * 1000.0
+        video_t = torch.full((B,), video_t_value, device=self.device, dtype=self.dtype)
+
+        video_tokens = self.video_module.prepare_input(video_latent.to(self.dtype))
+        action_tokens, action_layout = self._encode_extended_action_tokens(
+            state=state,
+            action_latent=action_latent,
+            base_action_len=base_len,
+            chunk_stage=chunk_stage,
+        )
+        und_tokens = self.und_module.extract_und_features(vlm_inputs)
+        attn_mask = self._build_action_chunk_causal_attn_mask(
+            video_token_len=video_tokens.shape[1],
+            action_token_len=action_tokens.shape[1],
+            und_token_len=und_tokens.shape[1],
+            layout=action_layout,
+            multiplier=multiplier,
+        )
+        action_t = self._extended_action_token_timesteps(chunk_t, action_layout)
+        if processed_t5_context is None:
+            processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
+
+        with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
+            video_head_time_emb, video_adaln_params = self.video_module.get_time_embedding(
+                video_t,
+                video_tokens.shape[1],
+            )
+            action_head_time_emb, action_adaln_params = self.action_module.get_time_embedding(
+                action_t,
+                action_tokens.shape[1],
+            )
+            for layer_idx in range(self.config.num_layers):
+                video_tokens, action_tokens, und_tokens = self._process_mot_layer(
+                    video_tokens,
+                    action_tokens,
+                    und_tokens,
+                    video_adaln_params,
+                    action_adaln_params,
+                    processed_t5_context,
+                    layer_idx,
+                    attn_mask=attn_mask,
+                )
+
+            video_velocity = self.video_module.apply_output_head(video_tokens, video_head_time_emb)
+            action_velocity = self._decode_extended_action_velocity(
+                action_tokens,
+                action_head_time_emb,
+                action_layout,
+            )
+
+        return video_velocity, action_velocity
+
+    def _rolling_action_replan(
+        self,
+        first_frame: torch.Tensor,
+        state: torch.Tensor,
+        language_embeddings: Optional[List[torch.Tensor]],
+        vlm_inputs: Optional[Any],
+        prev_action_latent: Optional[torch.Tensor],
+        prev_chunk_stage: Optional[torch.Tensor],
+        multiplier: int,
+        pipeline_depth: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B = first_frame.shape[0]
+        base_len = int(self.config.action_chunk_size)
+        extended_len = base_len * multiplier
+        state = state.to(self.device, dtype=self.dtype)
+        condition_frame_latent, video_latent, action_latent, chunk_stage = self._init_rolling_replan_state(
+            first_frame=first_frame,
+            state=state,
+            prev_action_latent=prev_action_latent,
+            prev_chunk_stage=prev_chunk_stage,
+            multiplier=multiplier,
+            pipeline_depth=pipeline_depth,
+        )
+        target_stage = self._rolling_target_stage(B, multiplier, pipeline_depth)
         stages_to_run = int((target_stage - chunk_stage).clamp_min(0).max().item())
         stages_to_run = max(0, min(pipeline_depth, stages_to_run))
         processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
@@ -1466,60 +1573,18 @@ class Motus(nn.Module):
             if not bool(active_chunks.any().item()):
                 break
 
-            chunk_t = (
-                (pipeline_depth - chunk_stage).clamp(0, pipeline_depth).to(self.dtype)
-                / float(pipeline_depth)
-            ) * 1000.0
-            video_t_value = (
-                float(pipeline_depth - min(video_step_idx, pipeline_depth))
-                / float(pipeline_depth)
-            ) * 1000.0
-            video_t = torch.full((B,), video_t_value, device=self.device, dtype=self.dtype)
-
-            video_tokens = self.video_module.prepare_input(video_latent.to(self.dtype))
-            action_tokens, action_layout = self._encode_extended_action_tokens(
+            video_velocity, action_velocity = self._rolling_action_model_step(
                 state=state,
+                language_embeddings=language_embeddings,
+                vlm_inputs=vlm_inputs,
+                video_latent=video_latent,
                 action_latent=action_latent,
-                base_action_len=base_len,
                 chunk_stage=chunk_stage,
-            )
-            und_tokens = self.und_module.extract_und_features(vlm_inputs)
-            attn_mask = self._build_action_chunk_causal_attn_mask(
-                video_token_len=video_tokens.shape[1],
-                action_token_len=action_tokens.shape[1],
-                und_token_len=und_tokens.shape[1],
-                layout=action_layout,
                 multiplier=multiplier,
+                pipeline_depth=pipeline_depth,
+                video_step_idx=video_step_idx,
+                processed_t5_context=processed_t5_context,
             )
-            action_t = self._extended_action_token_timesteps(chunk_t, action_layout)
-
-            with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
-                video_head_time_emb, video_adaln_params = self.video_module.get_time_embedding(
-                    video_t,
-                    video_tokens.shape[1],
-                )
-                action_head_time_emb, action_adaln_params = self.action_module.get_time_embedding(
-                    action_t,
-                    action_tokens.shape[1],
-                )
-                for layer_idx in range(self.config.num_layers):
-                    video_tokens, action_tokens, und_tokens = self._process_mot_layer(
-                        video_tokens,
-                        action_tokens,
-                        und_tokens,
-                        video_adaln_params,
-                        action_adaln_params,
-                        processed_t5_context,
-                        layer_idx,
-                        attn_mask=attn_mask,
-                    )
-
-                video_velocity = self.video_module.apply_output_head(video_tokens, video_head_time_emb)
-                action_velocity = self._decode_extended_action_velocity(
-                    action_tokens,
-                    action_head_time_emb,
-                    action_layout,
-                )
 
             video_active = active_chunks.any(dim=1)
             video_dt = video_active.to(self.dtype).view(B, 1, 1, 1, 1) * (-1.0 / float(pipeline_depth))
@@ -1538,37 +1603,50 @@ class Motus(nn.Module):
 
         return action_latent, chunk_stage
 
-    def _rolling_action_distill_loss(
+    def _rolled_state_fm_loss(
         self,
         rolling_condition_frames: torch.Tensor,
         rolling_initial_states: torch.Tensor,
         rolling_vlm_inputs: Optional[List[Any]],
+        rolling_target_action_chunks: torch.Tensor,
         language_embeddings: Optional[List[torch.Tensor]],
-        target_action_chunk: torch.Tensor,
         multiplier: int,
         pipeline_depth: int,
     ) -> torch.Tensor:
-        if rolling_condition_frames is None or rolling_initial_states is None or rolling_vlm_inputs is None:
+        if (
+            rolling_condition_frames is None
+            or rolling_initial_states is None
+            or rolling_vlm_inputs is None
+            or rolling_target_action_chunks is None
+        ):
             raise ValueError(
-                "rolling_action_distill is enabled, but rolling_condition_frames, "
-                "rolling_initial_states, or rolling_vlm_inputs is missing from the batch"
+                "rolled_state_fm is enabled, but rolling_condition_frames, "
+                "rolling_initial_states, rolling_vlm_inputs, or rolling_target_action_chunks "
+                "is missing from the batch"
             )
         if rolling_condition_frames.shape[1] < multiplier or rolling_initial_states.shape[1] < multiplier:
             raise ValueError(
-                f"rolling_action_distill requires {multiplier} rolling steps, got "
+                f"rolled_state_fm requires {multiplier} rolling steps, got "
                 f"frames={rolling_condition_frames.shape[1]} states={rolling_initial_states.shape[1]}"
             )
         if not isinstance(rolling_vlm_inputs, list) or len(rolling_vlm_inputs) < multiplier:
             raise ValueError(
-                f"rolling_action_distill requires {multiplier} step-wise VLM inputs, "
+                f"rolled_state_fm requires {multiplier} step-wise VLM inputs, "
                 f"got {type(rolling_vlm_inputs).__name__}"
             )
+        if rolling_target_action_chunks.shape[1] < multiplier or rolling_target_action_chunks.shape[2] < multiplier:
+            raise ValueError(
+                f"rolled_state_fm requires target chunks shaped [B,{multiplier},{multiplier},L,D], "
+                f"got {tuple(rolling_target_action_chunks.shape)}"
+            )
 
+        B = rolling_condition_frames.shape[0]
+        base_len = int(self.config.action_chunk_size)
         prev_action_latent = None
         prev_chunk_stage = None
-        for step_idx in range(multiplier):
-            context = torch.enable_grad() if step_idx == multiplier - 1 else torch.no_grad()
-            with context:
+
+        for step_idx in range(multiplier - 1):
+            with torch.no_grad():
                 action_latent, chunk_stage = self._rolling_action_replan(
                     first_frame=rolling_condition_frames[:, step_idx],
                     state=rolling_initial_states[:, step_idx],
@@ -1579,15 +1657,70 @@ class Motus(nn.Module):
                     multiplier=multiplier,
                     pipeline_depth=pipeline_depth,
                 )
-            prev_action_latent = action_latent if step_idx == multiplier - 1 else action_latent.detach()
+            prev_action_latent = action_latent.detach()
             prev_chunk_stage = chunk_stage.detach()
 
-        predicted_current_chunk = prev_action_latent[:, : int(self.config.action_chunk_size)]
-        return torch.nn.functional.mse_loss(
-            predicted_current_chunk.float(),
-            target_action_chunk.to(self.device).float(),
-            reduction="mean",
+        final_step_idx = multiplier - 1
+        state = rolling_initial_states[:, final_step_idx].to(self.device, dtype=self.dtype)
+        _, video_latent, action_latent, chunk_stage = self._init_rolling_replan_state(
+            first_frame=rolling_condition_frames[:, final_step_idx],
+            state=state,
+            prev_action_latent=prev_action_latent,
+            prev_chunk_stage=prev_chunk_stage,
+            multiplier=multiplier,
+            pipeline_depth=pipeline_depth,
         )
+        target_stage = self._rolling_target_stage(B, multiplier, pipeline_depth)
+        active_chunks = chunk_stage < target_stage
+        processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
+        _, action_velocity = self._rolling_action_model_step(
+            state=state,
+            language_embeddings=language_embeddings,
+            vlm_inputs=rolling_vlm_inputs[final_step_idx],
+            video_latent=video_latent,
+            action_latent=action_latent,
+            chunk_stage=chunk_stage,
+            multiplier=multiplier,
+            pipeline_depth=pipeline_depth,
+            video_step_idx=0,
+            processed_t5_context=processed_t5_context,
+        )
+
+        action_latent_chunks = action_latent.detach().reshape(
+            B,
+            multiplier,
+            base_len,
+            self.config.action_dim,
+        )
+        target_chunks = rolling_target_action_chunks[
+            :,
+            final_step_idx,
+            :multiplier,
+        ].to(device=self.device, dtype=self.dtype)
+        remaining_t = (
+            (pipeline_depth - chunk_stage).clamp_min(1).to(self.dtype)
+            / float(pipeline_depth)
+        ).view(B, multiplier, 1, 1)
+        velocity_target = (action_latent_chunks - target_chunks) / remaining_t
+        pred_velocity = action_velocity.reshape(B, multiplier, base_len, self.config.action_dim)
+
+        weights = torch.tensor(
+            [
+                float(self.config.extended_chunkwise_chunk_weight_0),
+                float(self.config.extended_chunkwise_chunk_weight_1),
+                float(self.config.extended_chunkwise_chunk_weight_2),
+            ],
+            device=self.device,
+            dtype=self.dtype,
+        )
+        if multiplier > weights.numel():
+            weights = torch.cat([weights, weights[-1].expand(multiplier - weights.numel())], dim=0)
+        weights = weights[:multiplier].view(1, multiplier)
+        chunk_mse = (pred_velocity.float() - velocity_target.float()).pow(2).mean(dim=(-1, -2))
+        loss_mask = active_chunks.to(chunk_mse.dtype)
+        weighted = chunk_mse * loss_mask * weights.float()
+        denom = (loss_mask * weights.float()).sum().clamp_min(1e-6)
+        return weighted.sum() / denom
 
     def extended_chunkwise_training_step(
         self,
@@ -1600,6 +1733,7 @@ class Motus(nn.Module):
         rolling_condition_frames: Optional[torch.Tensor] = None,
         rolling_initial_states: Optional[torch.Tensor] = None,
         rolling_vlm_inputs: Optional[List[Any]] = None,
+        rolling_target_action_chunks: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ) -> Dict[str, torch.Tensor]:
         B = video_frames.shape[0]
@@ -1695,20 +1829,18 @@ class Motus(nn.Module):
             self.config.video_loss_weight * video_loss +
             self.config.action_loss_weight * action_loss
         )
-        rolling_action_loss = None
-        if bool(getattr(self.config, "rolling_action_distill_enabled", False)):
-            clean_action_chunks = actions.reshape(B, multiplier, base_len, self.config.action_dim)
-            target_chunk_idx = min(multiplier - 1, clean_action_chunks.shape[1] - 1)
-            rolling_action_loss = self._rolling_action_distill_loss(
+        rolled_state_fm_loss = None
+        if bool(getattr(self.config, "rolled_state_fm_enabled", False)):
+            rolled_state_fm_loss = self._rolled_state_fm_loss(
                 rolling_condition_frames=rolling_condition_frames,
                 rolling_initial_states=rolling_initial_states,
                 rolling_vlm_inputs=rolling_vlm_inputs,
+                rolling_target_action_chunks=rolling_target_action_chunks,
                 language_embeddings=language_embeddings,
-                target_action_chunk=clean_action_chunks[:, target_chunk_idx].detach(),
                 multiplier=multiplier,
                 pipeline_depth=pipeline_depth,
             )
-            total_loss = total_loss + float(self.config.rolling_action_distill_weight) * rolling_action_loss
+            total_loss = total_loss + float(self.config.rolled_state_fm_weight) * rolled_state_fm_loss
 
         if return_dict:
             metrics = {
@@ -1725,10 +1857,10 @@ class Motus(nn.Module):
                 'action_timestep_mean': chunk_sigmas.float().mean().item(),
                 **chunk_metrics,
             }
-            if rolling_action_loss is not None:
-                metrics['rolling_action_distill_loss'] = rolling_action_loss
-                metrics['rolling_action_distill_weight'] = torch.tensor(
-                    float(self.config.rolling_action_distill_weight),
+            if rolled_state_fm_loss is not None:
+                metrics['rolled_state_fm_loss'] = rolled_state_fm_loss
+                metrics['rolled_state_fm_weight'] = torch.tensor(
+                    float(self.config.rolled_state_fm_weight),
                     device=self.device,
                 )
             return metrics
@@ -1762,6 +1894,7 @@ class Motus(nn.Module):
                 rolling_condition_frames=rolling_condition_frames,
                 rolling_initial_states=rolling_initial_states,
                 rolling_vlm_inputs=rolling_vlm_inputs,
+                rolling_target_action_chunks=kwargs.get("rolling_target_action_chunks", None),
                 return_dict=return_dict,
             )
         return self.training_step(

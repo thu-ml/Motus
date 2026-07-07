@@ -135,11 +135,11 @@ class T5EmbeddingProcessor:
 def process_t5_batch(args):
     """Function for processing T5 embeddings in parallel"""
     processor, meta_files = args
-    
-    # Set CUDA device for this process
-    device_num = processor.device.split(':')[1] if ':' in processor.device else '0'
-    os.environ['CUDA_VISIBLE_DEVICES'] = device_num
-    
+
+    # `processor.device` is interpreted in the current torch-visible device space.
+    # Do not set CUDA_VISIBLE_DEVICES here: doing so after constructing a
+    # processor for e.g. cuda:1 can remap the process to a single visible GPU and
+    # turn cuda:1 into an invalid ordinal.
     results = []
     for meta_path, t5_path in meta_files:
         success = processor.process_meta_file(meta_path, t5_path)
@@ -512,6 +512,14 @@ class RobotWinConverter:
             
             for dir_path in [videos_dir, qpos_dir, metas_dir]:
                 dir_path.mkdir(parents=True, exist_ok=True)
+
+            video_path = videos_dir / f"{episode_id}.mp4"
+            qpos_path = qpos_dir / f"{episode_id}.pt"
+            meta_path = metas_dir / f"{episode_id}.txt"
+
+            if self.config.get('skip_existing', False) and video_path.exists() and qpos_path.exists() and meta_path.exists():
+                logger.debug(f"Skipping existing episode {episode_id}")
+                return True
             
             # Extract images and create video
             images_dict = self.extract_images_from_hdf5(hdf5_path)
@@ -519,7 +527,6 @@ class RobotWinConverter:
                 logger.error(f"No images extracted from {hdf5_path}")
                 return False
             
-            video_path = videos_dir / f"{episode_id}.mp4"
             fps = self.config.get('fps', 30)
             if not self.create_concatenated_video(images_dict, str(video_path), fps):
                 logger.error(f"Failed to create video for episode {episode_id}")
@@ -533,7 +540,6 @@ class RobotWinConverter:
                     logger.warning(f"Skipping episode {episode_id}: qpos validation failed")
                     return False
                 
-                qpos_path = qpos_dir / f"{episode_id}.pt"
                 torch.save(qpos_data, qpos_path)
                 logger.debug(f"Saved qpos to {qpos_path}")
             else:
@@ -545,7 +551,6 @@ class RobotWinConverter:
             if instruction_path and os.path.exists(instruction_path):
                 instructions = self.process_instructions(instruction_path)
             
-            meta_path = metas_dir / f"{episode_id}.txt"
             if not self.create_meta_file(str(meta_path), instructions):
                 logger.error(f"Failed to create meta file for episode {episode_id}")
                 return False

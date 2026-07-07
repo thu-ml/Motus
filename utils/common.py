@@ -5,7 +5,24 @@ import math
 from pathlib import Path
 
 import torch
-import deepspeed.comm.comm as dist
+try:
+    import deepspeed.comm.comm as dist
+except ModuleNotFoundError:
+    import torch.distributed as _torch_dist
+
+    class _TorchDistCompat:
+        @staticmethod
+        def get_rank():
+            if _torch_dist.is_available() and _torch_dist.is_initialized():
+                return _torch_dist.get_rank()
+            return 0
+
+        @staticmethod
+        def barrier():
+            if _torch_dist.is_available() and _torch_dist.is_initialized():
+                _torch_dist.barrier()
+
+    dist = _TorchDistCompat()
 import imageio
 from safetensors import safe_open
 import numpy as np

@@ -1,7 +1,6 @@
 # Motus Policy for RoboTwin
 
 import torch
-import torch.nn as nn
 import numpy as np
 import cv2
 import json
@@ -14,15 +13,14 @@ from collections import deque
 import yaml
 from PIL import Image
 from transformers import AutoProcessor
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
 
-# Add model paths
-sys.path.append(str(Path(__file__).parent))
-sys.path.append(str(Path(__file__).parent / "models"))
+# Add policy-local paths before repo-level packages with the same names.
+POLICY_ROOT = Path(__file__).parent
+sys.path.insert(0, str(POLICY_ROOT))
+sys.path.insert(0, str(POLICY_ROOT / "models"))
 
 from models.motus import Motus, MotusConfig
+from utils.image_utils import resize_with_padding
 
 # Add bak path for T5EncoderModel
 BAK_ROOT = str((Path(__file__).parent / "bak").resolve())
@@ -30,7 +28,6 @@ if BAK_ROOT not in sys.path:
     sys.path.insert(0, BAK_ROOT)
 
 from wan.modules.t5 import T5EncoderModel
-from utils.image_utils import resize_with_padding
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +67,9 @@ class MotusPolicy:
         self.lora_dropout = float(os.environ.get("MOTUS_LORA_DROPOUT", lora_cfg.get('dropout', 0.0)))
         self.lora_target_linear = env_flag(os.environ.get("MOTUS_LORA_TARGET_LINEAR"), bool(lora_cfg.get('target_linear', True)))
         self.lora_target_qkv = env_flag(os.environ.get("MOTUS_LORA_TARGET_QKV"), bool(lora_cfg.get('target_qkv', True)))
+        requested_t5_device = os.environ.get("MOTUS_T5_DEVICE", device).strip().lower()
+        self.t5_device = "cpu" if requested_t5_device == "cpu" else device
+        self.t5_embedding_cache: Dict[str, Any] = {}
         
         # Initialize model WITHOUT loading pretrained backbones
         self.model = self._load_model()
@@ -78,7 +78,7 @@ class MotusPolicy:
         self.t5_encoder = T5EncoderModel(
             text_len=512,
             dtype=torch.bfloat16,
-            device=device,
+            device=self.t5_device,
             checkpoint_path=os.path.join(self.wan_path, 'models_t5_umt5-xxl-enc-bf16.pth'),
             tokenizer_path=os.path.join(self.wan_path, 'google', 'umt5-xxl'),
         )
@@ -102,6 +102,8 @@ class MotusPolicy:
         # Initialize image saving
         self.save_images = env_flag(os.environ.get("MOTUS_SAVE_IMAGES"), True)
         self.decode_video = not env_flag(os.environ.get("MOTUS_SKIP_VIDEO_DECODE"), False)
+        self.save_all_video_frames = env_flag(os.environ.get("MOTUS_SAVE_ALL_VIDEO_FRAMES"), False)
+        self.frame_grid_max_frames = max(0, int(os.environ.get("MOTUS_FRAME_GRID_MAX_FRAMES", "0") or "0"))
         base_log_dir = log_dir or os.environ.get('LOG_DIR') or str(Path(__file__).resolve().parent.parent / "logs")
         task_dir_name = task_name or os.environ.get('TASK_NAME') or "default_task"
         self.save_dir = Path(base_log_dir) / "images" / task_dir_name
@@ -110,37 +112,16 @@ class MotusPolicy:
         self.episode_count = 0
         self.step_count = 0
 
-        extended_cfg = dict(self.config_dict.get("model", {}).get("extended_chunkwise_finetune", {}) or {})
-        extended_cfg.update(self.lora_checkpoint_config.get("extended_chunkwise_finetune", {}) or {})
-        pipeline_switch_text = str(os.environ.get("MOTUS_PIPELINE_DENOISE", "") or "").strip().lower()
-        pipeline_mode_env = os.environ.get("MOTUS_PIPELINE_DENOISE_MODE", "").strip().lower()
-        extended_horizon_modes = {
-            "extended",
-            "extended_horizon",
-            "extended-horizon",
-            "extended_horizon_pipeline",
-            "extended-horizon-pipeline",
-            "extended_prefix_pipeline",
-            "extended-prefix-pipeline",
-        }
-        self.extended_horizon_enabled = (
-            env_flag(os.environ.get("MOTUS_EXTENDED_HORIZON"), bool(extended_cfg.get("enabled", False)))
-            or env_flag(os.environ.get("MOTUS_EXTENDED_HORIZON_PIPELINE"), False)
-            or pipeline_switch_text in extended_horizon_modes
-            or pipeline_mode_env in extended_horizon_modes
+        pipeline_cfg = dict(self.config_dict.get("model", {}).get("extended_chunkwise_finetune", {}) or {})
+        pipeline_cfg.update(self.lora_checkpoint_config.get("extended_chunkwise_finetune", {}) or {})
+        self.pipeline_enabled = env_flag(
+            os.environ.get("MOTUS_PIPELINE_DENOISE"),
+            bool(pipeline_cfg.get("enabled", False)),
         )
-        self.pipeline_enabled = self.extended_horizon_enabled
-        self.pipeline_mode = "extended_horizon" if self.extended_horizon_enabled else pipeline_mode_env
-
-        self.extended_horizon_multiplier = max(
+        self.pipeline_multiplier = max(
             1,
-            int(os.environ.get("MOTUS_EXTENDED_HORIZON_MULTIPLIER", extended_cfg.get("multiplier", 3))),
+            int(os.environ.get("MOTUS_PIPELINE_MULTIPLIER", pipeline_cfg.get("multiplier", 3))),
         )
-        self.extended_prefix_mask = env_flag(os.environ.get("MOTUS_EXTENDED_PREFIX_MASK"), True)
-        self.extended_prefix_mask_backend = os.environ.get(
-            "MOTUS_EXTENDED_PREFIX_MASK_BACKEND",
-            "chunk_causal",
-        ).strip().lower()
         self.exec_actions_override = os.environ.get("MOTUS_EXEC_ACTIONS")
         self.pipeline_replan_idx = 0
 
@@ -251,11 +232,6 @@ class MotusPolicy:
         ffn_multiplier = model_cfg['action_expert']['ffn_dim_multiplier']
         extended_cfg = dict(model_cfg.get("extended_chunkwise_finetune", {}) or {})
         extended_cfg.update(self.lora_checkpoint_config.get("extended_chunkwise_finetune", {}) or {})
-        time_distribution = dict(model_cfg.get("time_distribution", {}) or {})
-        time_distribution.update(self.lora_checkpoint_config.get("time_distribution", {}) or {})
-        chunk_loss_weights = list(extended_cfg.get("chunk_loss_weights", [1.0, 0.7, 0.5]))
-        while len(chunk_loss_weights) < 3:
-            chunk_loss_weights.append(chunk_loss_weights[-1] if chunk_loss_weights else 1.0)
 
         config = MotusConfig(
             # Paths for config loading only (no weights loaded)
@@ -287,7 +263,6 @@ class MotusPolicy:
             num_video_frames=common['num_video_frames'],
             video_loss_weight=1.0,
             action_loss_weight=1.0,
-            time_distribution=time_distribution,
             
             # Inference config
             batch_size=1,
@@ -297,22 +272,11 @@ class MotusPolicy:
             # Don't load pretrained backbones - will load full model from checkpoint
             load_pretrained_backbones=False,
             training_mode='finetune',
-            lora_enabled=self.lora_enabled,
-            lora_rank=self.lora_rank,
-            lora_alpha=self.lora_alpha,
-            lora_dropout=self.lora_dropout,
-            lora_target_linear=self.lora_target_linear,
-            lora_target_qkv=self.lora_target_qkv,
             extended_chunkwise_enabled=bool(extended_cfg.get("enabled", False)),
             extended_chunkwise_multiplier=int(extended_cfg.get("multiplier", 3)),
             extended_chunkwise_pipeline_depth=int(extended_cfg.get("pipeline_depth", 3)),
             extended_chunkwise_chunk_causal_mask=bool(extended_cfg.get("chunk_causal_mask", True)),
             extended_chunkwise_pipeline_embeddings=bool(extended_cfg.get("pipeline_embeddings", True)),
-            extended_chunkwise_chunk_weight_0=float(chunk_loss_weights[0]),
-            extended_chunkwise_chunk_weight_1=float(chunk_loss_weights[1]),
-            extended_chunkwise_chunk_weight_2=float(chunk_loss_weights[2]),
-            extended_chunkwise_constant_weight=float(extended_cfg.get("temporally_constant_weight", 0.2)),
-            extended_chunkwise_chunkwise_weight=float(extended_cfg.get("chunk_wise_weight", 0.8)),
         )
 
         return config
@@ -390,7 +354,12 @@ class MotusPolicy:
                         "a fixed rear camera, a movable left arm camera, and a movable right arm camera. "
                         "The aloha robot is currently performing the following task: ")
         instruction = f"{scene_prefix}{self.current_instruction}"
-        t5_out = self.t5_encoder([instruction], self.device)
+        t5_out = self.t5_embedding_cache.get(instruction)
+        if t5_out is None:
+            t5_out = self.t5_encoder([instruction], self.t5_device)
+            if self.t5_device == "cpu":
+                t5_out = [item.detach().cpu() for item in t5_out]
+            self.t5_embedding_cache[instruction] = t5_out
         if isinstance(t5_out, torch.Tensor):
             t5_list = [t5_out.squeeze(0)] if t5_out.dim() == 3 else [t5_out]
         elif isinstance(t5_out, list):
@@ -405,13 +374,10 @@ class MotusPolicy:
         # Run inference
         num_inference_steps = max(1, configured_steps)
         pipeline_config = {}
-        if self.extended_horizon_enabled:
+        if self.pipeline_enabled:
             pipeline_config = {
-                "mode": "extended_horizon",
-                "extended_horizon_enabled": True,
-                "extended_horizon_multiplier": self.extended_horizon_multiplier,
-                "extended_prefix_mask": self.extended_prefix_mask,
-                "extended_prefix_mask_backend": self.extended_prefix_mask_backend,
+                "enabled": True,
+                "multiplier": self.pipeline_multiplier,
             }
         with torch.no_grad():
             predicted_frames, predicted_actions = self.model.inference_step(
@@ -424,12 +390,13 @@ class MotusPolicy:
                 decode_video=self.decode_video,
             )
 
-        if self.extended_horizon_enabled:
+        if self.pipeline_enabled:
             info = getattr(self.model, "last_pipeline_denoise_info", {})
             effective_reuse_allowed = bool(info.get("reuse_allowed", False))
             print(
-                "Extended horizon denoise "
-                f"replan={self.pipeline_replan_idx} reuse={effective_reuse_allowed} "
+                "Rolling action pipeline "
+                f"replan={self.pipeline_replan_idx} exec_actions={execute_actions} "
+                f"reuse={effective_reuse_allowed} "
                 f"info={info}",
                 flush=True,
             )
@@ -462,9 +429,10 @@ class MotusPolicy:
 
     def _get_execute_actions(self) -> int:
         action_chunk_size = self._get_action_chunk_size()
-        if self.exec_actions_override is None or not self.exec_actions_override.strip():
+        exec_actions_text = self.exec_actions_override
+        if exec_actions_text is None or not exec_actions_text.strip():
             return action_chunk_size
-        return max(1, min(action_chunk_size, int(self.exec_actions_override)))
+        return max(1, min(action_chunk_size, int(exec_actions_text)))
 
     def _tensor_to_pil_image(self, tensor_chw: torch.Tensor) -> Image.Image:
         """Convert [C, H, W] tensor to PIL Image."""
@@ -543,14 +511,17 @@ class MotusPolicy:
         condition_np = tensor_to_numpy(condition_frame)
         predicted_np = []
         num_pred_frames = predicted_frames.shape[0]
+        max_frames = num_pred_frames if self.save_all_video_frames else min(num_pred_frames, 4)
+        if self.frame_grid_max_frames > 0:
+            max_frames = min(max_frames, self.frame_grid_max_frames)
         for i in range(num_pred_frames):
             frame_np = tensor_to_numpy(predicted_frames[i])
             predicted_np.append(frame_np)
         
-        while len(predicted_np) < 4:
+        while len(predicted_np) < max_frames:
             predicted_np.append(predicted_np[-1] if predicted_np else condition_np)
         
-        all_frames = [condition_np] + predicted_np[:4]
+        all_frames = [condition_np] + predicted_np[:max_frames]
         grid_image = np.concatenate(all_frames, axis=1)
         
         return Image.fromarray(grid_image)
@@ -632,6 +603,8 @@ def reset_model(model):
     model.is_first_step = True
     model.prev_action = None
     model.pipeline_replan_idx = 0
+    if hasattr(model, "model") and hasattr(model.model, "reset_pipeline_state"):
+        model.model.reset_pipeline_state()
     model.episode_count += 1
     model.step_count = 0
     logger.info(f"Model reset completed for episode {model.episode_count}")

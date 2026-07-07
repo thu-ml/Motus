@@ -12,6 +12,7 @@ __pycache__/
 *.pth
 *.pt
 *.safetensors
+*.pid
 data/processed*
 data/raw*
 MemFlow/
@@ -19,6 +20,7 @@ output/
 outputs/
 wandb/*
 slurm-*.out
+inference/robotwin/Motus/logs_eval*/
 
 # C extensions
 *.so

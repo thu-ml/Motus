@@ -20,13 +20,14 @@ model:
   load_pretrained_backbones: false
   activation_checkpointing: true
   activation_checkpointing_use_reentrant: false
+  activation_checkpointing_interval: 2
   wan:
-    config_path: "/home/hnliu/storage2/users/hnliu_data/WAM_old/Motus/pretrained_models/Wan2.2-TI2V-5B"
-    checkpoint_path: "/home/hnliu/storage2/users/hnliu_data/WAM_old/Motus/pretrained_models/Wan2.2-TI2V-5B"
-    vae_path: "/home/hnliu/storage2/users/hnliu_data/WAM_old/Motus/pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    config_path: "/tmp/hnliu_wam_accel/local_models/motus_runtime_min_20260620/Wan2.2-TI2V-5B"
+    checkpoint_path: "/tmp/hnliu_wam_accel/local_models/motus_runtime_min_20260620/Wan2.2-TI2V-5B"
+    vae_path: "/tmp/hnliu_wam_accel/local_models/motus_runtime_min_20260620/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
     precision: "bfloat16"
   vlm:
-    checkpoint_path: "/home/hnliu/storage2/users/hnliu_data/WAM_old/Motus/pretrained_models/Qwen3-VL-2B-Instruct"
+    checkpoint_path: "/tmp/hnliu_wam_accel/local_models/motus_runtime_min_20260620/Qwen3-VL-2B-Instruct"
     precision: "bfloat16"
     frozen: true
   action_expert:
@@ -40,15 +41,10 @@ model:
     vlm:
       input_dim: 2048
       projector_type: "mlp3x_silu"
-  time_distribution:
-    timestep_sample_method: "logit_normal"
-    sigmoid_scale: 1.0
-    min_t: 0.0
-    max_t: 1.0
   inference:
     num_inference_timesteps: 3
   loss_weights:
-    video_loss_weight: 1.0
+    video_loss_weight: 0.1
     action_loss_weight: 1.0
   lora:
     enabled: true
@@ -66,6 +62,8 @@ model:
     temporally_constant_weight: 0.2
     chunk_wise_weight: 0.8
     chunk_loss_weights: [1.0, 0.7, 0.5]
+    rolled_state_fm_enabled: true
+    rolled_state_fm_weight: 1.0
   ema:
     enabled: false
     update_after_step: 0
@@ -75,7 +73,7 @@ model:
     max_value: 0.9999
 
 training:
-  batch_size: 32
+  batch_size: 4
   gradient_accumulation_steps: 1
   max_steps: 3000
   learning_rate: 5.0e-5
@@ -90,12 +88,12 @@ training:
   find_unused_parameters: false
 
 system:
-  checkpoint_dir: "/home/hnliu/storage2/users/hnliu_data/wam_accel/runs/put_bottles_dustbin_pipeline_aware_lora"
+  checkpoint_dir: "/home/hnliu/storage2/users/hnliu_data/wam_accel/runs/put_bottles_dustbin_rolled_state_fm_w1_currenthost"
   log_level: "INFO"
   log_interval: 20
   save_interval: 500
-  val_interval: 1000
-  num_workers: 0
+  val_interval: 100000
+  num_workers: 2
   pin_memory: false
   save_lora_only: true
 
@@ -103,11 +101,11 @@ logging:
   report_to: "none"
   wandb_project: "motus"
   tensorboard_log_dir: "tensorboard_logs"
-  run_name: "put_bottles_dustbin_pipeline_aware_lora_bs32_ckpt"
+  run_name: "put_bottles_dustbin_rolled_state_fm_w1_bs4_acc1_workers2_currenthost"
 
 resume:
   checkpoint_path: null
 
 finetune:
-  checkpoint_path: "/home/hnliu/storage2/users/hnliu_data/WAM_old/Motus/pretrained_models/Motus_robotwin2"
+  checkpoint_path: "/tmp/hnliu_wam_accel/local_models/motus_runtime_min_20260620/Motus_robotwin2"
   load_method: "full"

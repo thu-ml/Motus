@@ -20,6 +20,7 @@ from wan.modules.model import sinusoidal_embedding_1d
 from transformers import Qwen3VLForConditionalGeneration, AutoConfig
 from .wan_model import WanVideoModel
 from .action_expert import ActionExpert, ActionExpertConfig
+from .losses import future_video_mse_loss
 from .und_expert import UndExpert, UndExpertConfig
 # Add Flow-Matching schedulers
 from wan.utils.fm import FlowMatchScheduler
@@ -881,11 +882,9 @@ class Motus(nn.Module):
             else:
                 action_pred = action_pred_full[:, 1:up_len, :]
 
-            # Video loss (mask the first frame)
-            video_pred_masked = video_pred.clone()
-            video_pred_masked[:, :, 0:1] = 0
-            video_loss = torch.nn.functional.mse_loss(video_pred_masked, video_target, reduction='mean')
-        
+            # Video loss (exclude the conditioning frame from the reduction)
+            video_loss = future_video_mse_loss(video_pred, video_target)
+
             # Action loss
             action_loss = torch.nn.functional.mse_loss(action_pred, action_target, reduction='mean')
 

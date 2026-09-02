@@ -48,7 +48,13 @@ class MotusPolicy:
         # Load configuration
         with open(config_path, 'r') as f:
             self.config_dict = yaml.safe_load(f)
-        
+
+        # The model is trained in a specific action space.  Resolve that
+        # contract from the checkpoint metadata first, then the deployment
+        # config.  Older checkpoints do not carry the field and therefore
+        # retain the raw-qpos behavior used by the original RobotWin runs.
+        self.action_normalization = self._resolve_action_normalization()
+
         # Initialize model WITHOUT loading pretrained backbones
         self.model = self._load_model()
 
@@ -70,12 +76,14 @@ class MotusPolicy:
         
         # Model state
         self.current_state = None
+        self.current_state_model = None
         self.current_state_norm = None
         self.is_first_step = True
         self.prev_action = None
 
-        # Load normalization stats
-        self._load_normalization_stats()
+        # Load stats only when the selected model contract requires them.
+        if self.action_normalization == "min_max":
+            self._load_normalization_stats()
         
         # Initialize image saving
         self.save_images = True
@@ -92,6 +100,77 @@ class MotusPolicy:
         """Set the current instruction for the policy."""
         self.current_instruction = instruction
         logger.info(f"Instruction set: {instruction}")
+
+    def _resolve_action_normalization(self) -> str:
+        """Resolve and validate the state/action representation.
+
+        A checkpoint's ``config.json`` is authoritative when it records the
+        mode.  If both the checkpoint and deployment config specify a mode,
+        reject a mismatch instead of silently feeding a model the wrong
+        numerical distribution.  Checkpoints produced before this field was
+        introduced default to raw qpos (``none``).
+        """
+        config_common = self.config_dict.get("common", {}) or {}
+        configured_mode = config_common.get("action_normalization")
+        checkpoint_mode = None
+
+        checkpoint_path = Path(self.checkpoint_path) if self.checkpoint_path else None
+        if checkpoint_path is not None:
+            metadata_path = (
+                checkpoint_path / "config.json"
+                if checkpoint_path.is_dir()
+                else checkpoint_path.parent / "config.json"
+            )
+            if metadata_path.exists():
+                try:
+                    import json
+
+                    with metadata_path.open("r", encoding="utf-8") as metadata_file:
+                        metadata = json.load(metadata_file)
+                    if not isinstance(metadata, dict):
+                        raise ValueError("checkpoint metadata must be a JSON object")
+                    checkpoint_common = metadata.get("common", {}) or {}
+                    if not isinstance(checkpoint_common, dict):
+                        raise ValueError("checkpoint common metadata must be an object")
+                    checkpoint_mode = checkpoint_common.get("action_normalization")
+                except (OSError, ValueError) as exc:
+                    raise ValueError(
+                        "Could not read checkpoint action-space metadata from "
+                        f"{metadata_path}"
+                    ) from exc
+
+        if configured_mode is not None and checkpoint_mode is not None:
+            if configured_mode != checkpoint_mode:
+                raise ValueError(
+                    "Action normalization mismatch: deployment config requests "
+                    f"{configured_mode!r}, but checkpoint metadata records "
+                    f"{checkpoint_mode!r}"
+                )
+
+        mode = checkpoint_mode if checkpoint_mode is not None else configured_mode
+        if mode is None:
+            mode = "none"
+        if mode not in {"none", "min_max"}:
+            raise ValueError(
+                "action_normalization must be 'none' or 'min_max', "
+                f"got {mode!r}"
+            )
+        logger.info("Action normalization mode: %s", mode)
+        return mode
+
+    def _model_state(self) -> torch.Tensor:
+        """Return the observation state in the checkpoint's model space."""
+        if self.current_state is None:
+            raise ValueError("No robot state available. Call update_obs first.")
+        if self.action_normalization == "min_max":
+            return self._normalize_actions(self.current_state)
+        return self.current_state
+
+    def _environment_actions(self, predicted_actions: torch.Tensor) -> torch.Tensor:
+        """Convert model actions to the qpos space consumed by RoboTwin."""
+        if self.action_normalization == "min_max":
+            return self._denormalize_actions(predicted_actions)
+        return predicted_actions
 
     def _load_model(self) -> Motus:
         """Load the Motus model without pretrained backbones, then load checkpoint."""
@@ -218,8 +297,27 @@ class MotusPolicy:
         else:
             state_tensor = state.float().unsqueeze(0) if state.dim() == 1 else state.float()
 
+        if state_tensor.ndim != 2:
+            raise ValueError(
+                f"Robot state must have shape [batch, dim], got {tuple(state_tensor.shape)}"
+            )
+        expected_state_dim = int(
+            self.config_dict["common"].get("state_dim", state_tensor.shape[-1])
+        )
+        if state_tensor.shape[-1] != expected_state_dim:
+            raise ValueError(
+                f"Robot state dimension {state_tensor.shape[-1]} does not match "
+                f"configured state_dim {expected_state_dim}"
+            )
+
         self.current_state = state_tensor.to(self.device)
-        self.current_state_norm = self._normalize_actions(self.current_state).to(self.device)
+        self.current_state_model = self._model_state()
+        # Preserve the old attribute for integrations that inspected it, but
+        # make its meaning explicit: it is populated only for normalized
+        # checkpoints and is never an implicit second source of truth.
+        self.current_state_norm = (
+            self.current_state_model if self.action_normalization == "min_max" else None
+        )
     
     def get_action(self, instruction: str = None) -> List[np.ndarray]:
         """Get action predictions from the model."""
@@ -253,7 +351,7 @@ class MotusPolicy:
         with torch.no_grad():
             predicted_frames, predicted_actions = self.model.inference_step(
                 first_frame=current_frame,
-                state=self.current_state,
+                state=self._model_state(),
                 num_inference_steps=num_inference_steps,
                 language_embeddings=t5_list,
                 vlm_inputs=[vlm_inputs],
@@ -273,7 +371,13 @@ class MotusPolicy:
                 self._save_frame_grid(condition_frame_viz, predicted_frames_viz)
                 self.step_count += 1
 
-        actions_real = predicted_actions.squeeze(0).cpu().numpy()
+        predicted_actions = predicted_actions.squeeze(0)
+        if predicted_actions.ndim != 2:
+            raise ValueError(
+                "Model actions must have shape [time, action_dim] after removing "
+                f"the batch dimension, got {tuple(predicted_actions.shape)}"
+            )
+        actions_real = self._environment_actions(predicted_actions).cpu().numpy()
         self.prev_action = actions_real[-1].copy()
         self.action_cache.extend(actions_real)
 
@@ -311,34 +415,57 @@ class MotusPolicy:
         return vlm_inputs
 
     def _load_normalization_stats(self):
-        """Load action normalization stats."""
+        """Load and validate the RobotWin action-space statistics."""
+        stats_path = Path(__file__).parent / "utils" / "stat.json"
         try:
-            stat_path = Path(__file__).parent / 'utils' / 'stat.json'
-            with open(stat_path, 'r') as f:
-                stat_data = yaml.safe_load(f) if stat_path.suffix in ['.yml', '.yaml'] else None
+            with stats_path.open("r", encoding="utf-8") as stats_file:
+                stat_data = (
+                    yaml.safe_load(stats_file)
+                    if stats_path.suffix in [".yml", ".yaml"]
+                    else None
+                )
         except Exception:
             stat_data = None
         if stat_data is None:
-            import json as _json
-            with open(Path(__file__).parent / 'utils' / 'stat.json', 'r') as f:
-                stat_data = _json.load(f)
+            import json
 
-        stats = stat_data.get('robotwin2')
+            with stats_path.open("r", encoding="utf-8") as stats_file:
+                stat_data = json.load(stats_file)
+
+        stats = stat_data.get("robotwin2")
         if stats is None:
-            raise ValueError('Normalization stats not found')
-        self.action_min = torch.tensor(stats['min'], dtype=torch.float32, device=self.device)
-        self.action_max = torch.tensor(stats['max'], dtype=torch.float32, device=self.device)
+            raise ValueError("RobotWin normalization stats not found")
+        self.action_min = torch.tensor(stats["min"], dtype=torch.float32, device=self.device)
+        self.action_max = torch.tensor(stats["max"], dtype=torch.float32, device=self.device)
+        if self.action_min.ndim != 1 or self.action_max.shape != self.action_min.shape:
+            raise ValueError("RobotWin normalization min/max must be one-dimensional and matching")
         self.action_range = self.action_max - self.action_min
+        if not torch.isfinite(self.action_min).all() or not torch.isfinite(self.action_max).all():
+            raise ValueError("RobotWin normalization stats must be finite")
+        if torch.any(self.action_range <= 0):
+            raise ValueError("RobotWin normalization ranges must be positive")
 
     def _normalize_actions(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize to [0,1]."""
+        """Normalize state/actions to the model's [0, 1] min/max space."""
+        if self.action_min is None or self.action_max is None:
+            raise RuntimeError("Normalization stats are not loaded")
+        if x.shape[-1] != self.action_min.numel():
+            raise ValueError(
+                f"Expected last dimension {self.action_min.numel()}, got {x.shape[-1]}"
+            )
         shape = x.shape
         x_flat = x.reshape(-1, shape[-1])
         norm = (x_flat - self.action_min.unsqueeze(0)) / self.action_range.unsqueeze(0)
         return norm.reshape(shape)
 
     def _denormalize_actions(self, y: torch.Tensor) -> torch.Tensor:
-        """Denormalize from [0,1]."""
+        """Convert model-space actions back to RoboTwin qpos coordinates."""
+        if self.action_min is None or self.action_max is None:
+            raise RuntimeError("Normalization stats are not loaded")
+        if y.shape[-1] != self.action_min.numel():
+            raise ValueError(
+                f"Expected last dimension {self.action_min.numel()}, got {y.shape[-1]}"
+            )
         shape = y.shape
         y_flat = y.reshape(-1, shape[-1])
         denorm = y_flat * self.action_range.unsqueeze(0) + self.action_min.unsqueeze(0)
@@ -442,6 +569,8 @@ def reset_model(model):
     model.obs_cache.clear()
     model.action_cache.clear()
     model.current_state = None
+    model.current_state_model = None
+    model.current_state_norm = None
     model.is_first_step = True
     model.prev_action = None
     model.episode_count += 1

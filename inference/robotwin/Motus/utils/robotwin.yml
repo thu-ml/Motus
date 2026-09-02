@@ -14,6 +14,10 @@ common:
   global_downsample_rate: 3     # Global downsampling (e.g., 30Hz -> 20Hz)
   video_action_freq_ratio: 2    # Video:Action frequency ratio
 
+  # Leave unset to use the mode recorded in the checkpoint's config.json.
+  # Legacy RobotWin checkpoints default to raw qpos ("none").
+  action_normalization: null
+
 # Model configuration
 model:
   # Action Expert configuration

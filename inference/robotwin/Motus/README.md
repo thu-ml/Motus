@@ -122,6 +122,21 @@ tasks_file: "tasks_all.txt"
 - `wan_path` and `vlm_path`: Only config/tokenizer files are required, not full pretrained weights
 - `gpu_ids`: Leave empty `[]` for auto-detection, or specify GPU IDs like `[0, 1, 2, 3]`
 
+### Action-space contract
+
+RobotWin checkpoints trained before the action-space metadata was introduced
+use raw qpos values.  The deployment wrapper keeps that behavior for legacy
+checkpoints and reads `common.action_normalization` from a checkpoint's
+`config.json` when present.
+
+For a new normalized run, set `common.action_normalization: "min_max"` in the
+training config.  The data loader then applies the per-dimension statistics to
+both the conditioning state and action targets, while deployment normalizes
+the observed state and converts predicted actions back to qpos before calling
+the environment.  If a deployment config and checkpoint record different
+modes, evaluation stops with an explicit mismatch error instead of silently
+using an incompatible action distribution.
+
 ### Configure Task List
 
 Edit `tasks_all.txt` to specify which tasks to evaluate:

@@ -32,6 +32,9 @@ def create_dataset(config: OmegaConf, val: bool = False):
                 'video_action_freq_ratio': config.common.video_action_freq_ratio,
                 'num_video_frames': config.common.num_video_frames,
                 'video_size': (config.common.video_height, config.common.video_width),
+                # Keep state/action scaling synchronized with deployment.  A
+                # missing key retains the raw-qpos legacy behavior.
+                'action_normalization': config.common.get('action_normalization', 'none'),
             })
         
         # Add dataset-specific parameters
@@ -49,6 +52,8 @@ def create_dataset(config: OmegaConf, val: bool = False):
             params['image_aug'] = config.dataset.image_aug and not val  # No aug for validation
         if hasattr(config.dataset, 'randomized_limit_per_task'):
             params['randomized_limit_per_task'] = config.dataset.randomized_limit_per_task
+        if hasattr(config.dataset, 'normalization_stats_path'):
+            params['normalization_stats_path'] = config.dataset.normalization_stats_path
         
         # Add VLM checkpoint path
         if hasattr(config.model, 'vlm') and hasattr(config.model.vlm, 'checkpoint_path'):

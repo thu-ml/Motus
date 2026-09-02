@@ -26,6 +26,11 @@ from data.utils.image_utils import (
     load_video_frames, get_video_frame_count
 )
 
+# RobotWin checkpoints historically use raw qpos values.  Keep normalization
+# opt-in so that the data pipeline and deployment wrapper can share an
+# explicit action-space contract when a normalized checkpoint is trained.
+from data.utils.norm import normalize_actions, load_normalization_stats
+
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*multichannel.*")
 
 logger = logging.getLogger(__name__)
@@ -67,6 +72,12 @@ class RobotWinTaskDataset(data.Dataset):
         upsample_rate: int = 1,  # For compatibility with H_RDT
         val: bool = False,
         image_aug: bool = False,
+
+        # Action/state representation.  ``none`` is the legacy RobotWin
+        # representation; ``min_max`` applies the matching stats to both the
+        # conditioning state and target action sequence.
+        action_normalization: str = "none",
+        normalization_stats_path: Optional[str] = None,
         
         # VLM processing parameters
         vlm_checkpoint_path: Optional[str] = None,  # Path to VLM model
@@ -89,6 +100,10 @@ class RobotWinTaskDataset(data.Dataset):
             upsample_rate: Temporal data upsampling rate (for H_RDT compatibility)
             val: Whether this is validation set
             image_aug: Whether to apply image augmentation
+            action_normalization: ``none`` for raw qpos or ``min_max`` for
+                per-dimension min/max normalization
+            normalization_stats_path: Optional path to a stats JSON file.
+                Defaults to the repository's RobotWin stats.
         """
         self.dataset_dir = Path(dataset_dir)
         self.data_mode = data_mode
@@ -110,6 +125,39 @@ class RobotWinTaskDataset(data.Dataset):
         self.upsample_rate = upsample_rate
         self.val = val
         self.image_aug = image_aug
+
+        if action_normalization is None:
+            action_normalization = "none"
+        if action_normalization not in {"none", "min_max"}:
+            raise ValueError(
+                "action_normalization must be 'none' or 'min_max', "
+                f"got {action_normalization!r}"
+            )
+        self.action_normalization = action_normalization
+        self.action_min = None
+        self.action_max = None
+        if self.action_normalization == "min_max":
+            stats_path = (
+                Path(normalization_stats_path)
+                if normalization_stats_path is not None
+                else Path(__file__).resolve().parents[1] / "utils" / "stat.json"
+            )
+            self.action_min, self.action_max = load_normalization_stats(
+                str(stats_path), "robotwin2"
+            )
+            if self.action_min is None or self.action_max is None:
+                raise FileNotFoundError(
+                    f"RobotWin normalization stats could not be loaded from {stats_path}"
+                )
+            if self.action_min.shape != self.action_max.shape:
+                raise ValueError("RobotWin normalization min/max shapes must match")
+            if (
+                not np.isfinite(self.action_min).all()
+                or not np.isfinite(self.action_max).all()
+            ):
+                raise ValueError("RobotWin normalization stats must be finite")
+            if np.any(self.action_max <= self.action_min):
+                raise ValueError("RobotWin normalization ranges must be positive")
         
         # Validate parameters
         if task_mode == "single" and not task_name:
@@ -136,6 +184,7 @@ class RobotWinTaskDataset(data.Dataset):
         logger.info(f"  Video:Action frequency ratio: {video_action_freq_ratio}")
         logger.info(f"  Action chunk size: {self.action_chunk_size}")
         logger.info(f"  Video frames to predict: {num_video_frames}")
+        logger.info(f"  Action normalization: {self.action_normalization}")
         logger.info(f"  Total episodes: {self.total_episodes}")
         
         # Initialize VLM processor for complete VLM processing in dataset
@@ -328,10 +377,23 @@ class RobotWinTaskDataset(data.Dataset):
             actions.append(action)
         
         action_sequence = torch.stack(actions).float()
-        
-        # Normalize actions and initial state
-        # action_sequence = self._normalize_actions(action_sequence)
-        # initial_state = self._normalize_actions(initial_state.unsqueeze(0)).squeeze(0)  # Normalize state same way as actions
+
+        # State and actions are conditioned by the same action-space transform.
+        # Applying the transform here (rather than only at deployment) keeps
+        # the diffusion target distribution identical to the model input
+        # distribution.  ``none`` preserves released raw-qpos checkpoints.
+        if self.action_normalization == "min_max":
+            if action_sequence.shape[-1] != self.action_min.shape[0]:
+                raise ValueError(
+                    "RobotWin action dimension does not match normalization stats: "
+                    f"{action_sequence.shape[-1]} vs {self.action_min.shape[0]}"
+                )
+            action_sequence = normalize_actions(
+                action_sequence, self.action_min, self.action_max
+            )
+            initial_state = normalize_actions(
+                initial_state.unsqueeze(0), self.action_min, self.action_max
+            ).squeeze(0)
         
         return initial_state, action_sequence
     

@@ -11,6 +11,11 @@ common:
   # Sampling strategy parameters
   global_downsample_rate: 3     # Global downsampling (e.g., 30Hz -> 20Hz)
   video_action_freq_ratio: 2    # Video:Action frequency ratio
+
+  # Keep this representation synchronized with RoboTwin deployment.  The
+  # released RobotWin checkpoints were trained on raw qpos values; opt into
+  # min/max scaling only when training and deploying a new checkpoint together.
+  action_normalization: "none"  # "none" (raw qpos) or "min_max"
   
   # Training settings
 

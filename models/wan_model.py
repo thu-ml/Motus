@@ -12,6 +12,7 @@ from pathlib import Path
 
 from wan.modules.model import WanModel, sinusoidal_embedding_1d
 from wan.modules.vae2_2 import Wan2_2_VAE
+from utils.device import amp_autocast, resolve_device
 
 # Optional safetensors support
 try:
@@ -42,12 +43,12 @@ class WanVideoModel(nn.Module):
         self,
         model_config: Dict[str, Any],
         vae_path: str,
-        device: str = "cuda",
+        device: str = "auto",
         precision: str = "bfloat16"
     ):
         super().__init__()
         
-        self.device = torch.device(device)
+        self.device = resolve_device(device)
         self.precision = {
             "float32": torch.float32,
             "float16": torch.float16,
@@ -74,6 +75,8 @@ class WanVideoModel(nn.Module):
             Video latents [B, C', T', H', W']
         """
         with torch.no_grad():
+            vae_parameter = next(self.vae.model.parameters())
+            video_pixels = video_pixels.to(device=vae_parameter.device, dtype=vae_parameter.dtype)
             return self.vae.encode(video_pixels)
     
     def decode_video(self, video_latents: torch.Tensor) -> torch.Tensor:
@@ -87,9 +90,11 @@ class WanVideoModel(nn.Module):
             Video pixels [B, C', T', H', W'], range [-1, 1]
         """
         with torch.no_grad():
+            vae_parameter = next(self.vae.model.parameters())
             video_pixels = []
             for i in range(video_latents.shape[0]):
-                pixels = self.vae.decode([video_latents[i]])[0]
+                latent = video_latents[i].to(device=vae_parameter.device, dtype=vae_parameter.dtype)
+                pixels = self.vae.decode([latent])[0]
                 video_pixels.append(pixels)
             result = torch.stack(video_pixels, dim=0)
             return result
@@ -147,7 +152,7 @@ class WanVideoModel(nn.Module):
         # Time embeddings - handle batch of timesteps [B] -> [B, seq_len]
         if timestep.dim() == 1:
             timestep = timestep.unsqueeze(1).expand(timestep.size(0), seq_len)
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with amp_autocast(self.device, dtype=torch.float32):
             bt = timestep.size(0)
             t_flat = timestep.flatten()
             e = self.wan_model.time_embedding(
@@ -195,7 +200,7 @@ class WanVideoModel(nn.Module):
         cls,
         config_path: str,
         vae_path: str,
-        device: str = "cuda",
+        device: str = "auto",
         precision: str = "bfloat16"
     ) -> 'WanVideoModel':
         """
@@ -224,7 +229,7 @@ class WanVideoModel(nn.Module):
         checkpoint_path: str,
         vae_path: str,
         config_path: Optional[str] = None,
-        device: str = "cuda",
+        device: str = "auto",
         precision: str = "bfloat16"
     ) -> 'WanVideoModel':
         """

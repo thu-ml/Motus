@@ -17,6 +17,7 @@ if BAK_ROOT not in sys.path:
     sys.path.insert(0, BAK_ROOT)
 
 from wan.modules.t5 import T5EncoderModel
+from utils.device import resolve_device
 
 
 def main():
@@ -48,25 +49,27 @@ def main():
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to run encoding on"
+        default="auto",
+        help="Device to run encoding on ('auto', 'cuda', 'xpu', 'cpu')"
     )
     
     args = parser.parse_args()
+    device = str(resolve_device(args.device))
+    print(f"Using PyTorch device: {device}")
     
     # Initialize T5 encoder
     print(f"Loading T5 encoder from {args.wan_path}...")
     encoder = T5EncoderModel(
         text_len=args.text_len,
         dtype=torch.bfloat16,
-        device=args.device,
+        device=device,
         checkpoint_path=os.path.join(args.wan_path, 'Wan2.2-TI2V-5B', 'models_t5_umt5-xxl-enc-bf16.pth'),
         tokenizer_path=os.path.join(args.wan_path, 'Wan2.2-TI2V-5B', 'google/umt5-xxl'),
     )
     
     # Encode instruction
     print(f"Encoding instruction: '{args.instruction}'")
-    encoded = encoder([args.instruction], args.device)
+    encoded = encoder([args.instruction], device)
     
     # Handle output format (list of tensors)
     if isinstance(encoded, list):

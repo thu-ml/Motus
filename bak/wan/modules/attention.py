@@ -21,6 +21,74 @@ __all__ = [
 ]
 
 
+def _xpu_scaled_dot_product_attention(
+    q,
+    k,
+    v,
+    q_lens=None,
+    k_lens=None,
+    dropout_p=0.,
+    softmax_scale=None,
+    q_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    dtype=torch.bfloat16,
+):
+    out_dtype = q.dtype
+    half_dtypes = (torch.float16, torch.bfloat16)
+    q = q.transpose(1, 2).to(dtype if q.dtype not in half_dtypes else q.dtype)
+    k = k.transpose(1, 2).to(dtype if k.dtype not in half_dtypes else k.dtype)
+    v = v.transpose(1, 2).to(dtype if v.dtype not in half_dtypes else v.dtype)
+
+    if q_scale is not None:
+        q = q * q_scale
+
+    if q.size(1) != k.size(1):
+        if q.size(1) % k.size(1) != 0:
+            raise ValueError('XPU SDPA requires query heads to be divisible by key heads')
+        repeat_factor = q.size(1) // k.size(1)
+        k = k.repeat_interleave(repeat_factor, dim=1)
+        v = v.repeat_interleave(repeat_factor, dim=1)
+
+    batch_size, query_heads, query_length, _ = q.shape
+    key_length = k.shape[2]
+    attn_mask = None
+    if q_lens is not None or k_lens is not None or causal or window_size != (-1, -1):
+        attn_mask = torch.ones(
+            (batch_size, query_heads, query_length, key_length),
+            dtype=torch.bool,
+            device=q.device,
+        )
+        if q_lens is not None:
+            query_positions = torch.arange(query_length, device=q.device)
+            attn_mask &= query_positions.view(1, 1, -1, 1) < q_lens.to(q.device).view(-1, 1, 1, 1)
+        if k_lens is not None:
+            key_positions = torch.arange(key_length, device=q.device)
+            attn_mask &= key_positions.view(1, 1, 1, -1) < k_lens.to(q.device).view(-1, 1, 1, 1)
+        if causal:
+            query_positions = torch.arange(query_length, device=q.device).view(-1, 1)
+            key_positions = torch.arange(key_length, device=q.device).view(1, -1)
+            attn_mask &= key_positions <= query_positions + key_length - query_length
+        if window_size != (-1, -1):
+            query_positions = torch.arange(query_length, device=q.device).view(-1, 1)
+            key_positions = torch.arange(key_length, device=q.device).view(1, -1)
+            if window_size[0] >= 0:
+                attn_mask &= key_positions >= query_positions + key_length - query_length - window_size[0]
+            if window_size[1] >= 0:
+                attn_mask &= key_positions <= query_positions + key_length - query_length + window_size[1]
+
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=False,
+        scale=softmax_scale,
+    )
+    return out.transpose(1, 2).contiguous().to(out_dtype)
+
+
 def flash_attention(
     q,
     k,
@@ -51,7 +119,53 @@ def flash_attention(
     """
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
-    assert q.device.type == 'cuda' and q.size(-1) <= 256
+    assert q.device.type in ('cuda', 'xpu') and q.size(-1) <= 256
+
+    if q.device.type == 'xpu':
+        return _xpu_scaled_dot_product_attention(
+            q=q,
+            k=k,
+            v=v,
+            q_lens=q_lens,
+            k_lens=k_lens,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            q_scale=q_scale,
+            causal=causal,
+            window_size=window_size,
+            dtype=dtype,
+        )
+
+    if not FLASH_ATTN_2_AVAILABLE and not FLASH_ATTN_3_AVAILABLE:
+        out_dtype = q.dtype
+        q = q.transpose(1, 2).to(dtype)
+        k = k.transpose(1, 2).to(dtype)
+        v = v.transpose(1, 2).to(dtype)
+
+        attn_mask = None
+        if k_lens is not None or causal:
+            attn_mask = torch.ones(
+                (q.size(0), 1, q.size(2), k.size(2)),
+                dtype=torch.bool,
+                device=q.device,
+            )
+            if k_lens is not None:
+                key_positions = torch.arange(k.size(2), device=q.device)
+                attn_mask &= key_positions.view(1, 1, 1, -1) < k_lens.to(q.device).view(-1, 1, 1, 1)
+            if causal:
+                attn_mask &= torch.tril(
+                    torch.ones((q.size(2), k.size(2)), dtype=torch.bool, device=q.device)
+                ).view(1, 1, q.size(2), k.size(2))
+
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            scale=softmax_scale,
+        )
+        return out.transpose(1, 2).contiguous().to(out_dtype)
 
     # params
     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype

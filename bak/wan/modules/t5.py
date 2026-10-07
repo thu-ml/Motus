@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .tokenizers import HuggingfaceTokenizer
+from device_utils import resolve_device
 
 __all__ = [
     'T5Model',
@@ -437,9 +438,14 @@ def _t5(name,
     else:
         model_cls = T5Model
 
-    # init model
-    with torch.device(device):
-        model = model_cls(**kwargs)
+    # Initialize directly in the target dtype to avoid a full-size FP32 copy.
+    default_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(dtype)
+        with torch.device(device):
+            model = model_cls(**kwargs)
+    finally:
+        torch.set_default_dtype(default_dtype)
 
     # set device
     model = model.to(dtype=dtype, device=device)
@@ -475,11 +481,13 @@ class T5EncoderModel:
         self,
         text_len,
         dtype=torch.bfloat16,
-        device=torch.cuda.current_device(),
+        device=None,
         checkpoint_path=None,
         tokenizer_path=None,
         shard_fn=None,
     ):
+        # Resolved lazily: evaluating a CUDA API in the default argument breaks XPU-only builds.
+        device = resolve_device("auto") if device is None else device
         self.text_len = text_len
         self.dtype = dtype
         self.device = device
@@ -491,14 +499,14 @@ class T5EncoderModel:
             encoder_only=True,
             return_tokenizer=False,
             dtype=dtype,
-            device=device).eval().requires_grad_(False)
+            device='meta').eval().requires_grad_(False)
         logging.info(f'loading {checkpoint_path}')
-        model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(state_dict, assign=True)
+        del state_dict
         self.model = model
         if shard_fn is not None:
             self.model = shard_fn(self.model, sync_module_states=False)
-        else:
-            self.model.to(self.device)
         # init tokenizer
         self.tokenizer = HuggingfaceTokenizer(
             name=tokenizer_path, seq_len=text_len, clean='whitespace')

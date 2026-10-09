@@ -7,6 +7,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import flash_attention
+from utils.device import amp_autocast, disable_autocast
 
 __all__ = ['WanModel']
 
@@ -24,7 +25,7 @@ def sinusoidal_embedding_1d(dim, position):
     return x
 
 
-@torch.amp.autocast('cuda', enabled=False)
+@disable_autocast
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
     freqs = torch.outer(
@@ -37,7 +38,7 @@ def rope_params(max_seq_len, dim, theta=10000):
 
 from functools import lru_cache
 
-@torch.amp.autocast('cuda', enabled=False)
+@disable_autocast
 def rope_apply(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     B, T, N, CC = x.shape
     assert CC % 2 == 0, "last dim must be 2C (real, imag)"
@@ -78,7 +79,7 @@ def rope_apply(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor) -
     # assert rope_apply_original(x, grid_sizes, freqs).allclose(y, atol=1e-5)
     return y
 
-@torch.amp.autocast('cuda', enabled=False)
+@disable_autocast
 def rope_apply_original(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
 
@@ -356,7 +357,7 @@ class WanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.float32
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with amp_autocast(x.device, dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
         assert e[0].dtype == torch.float32
 
@@ -364,7 +365,7 @@ class WanAttentionBlock(nn.Module):
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
             seq_lens, grid_sizes, freqs)
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with amp_autocast(x.device, dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
         # cross-attention & ffn function
@@ -372,7 +373,7 @@ class WanAttentionBlock(nn.Module):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             y = self.ffn(
                 self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
-            with torch.amp.autocast('cuda', dtype=torch.float32):
+            with amp_autocast(x.device, dtype=torch.float32):
                 x = x + y * e[5].squeeze(2)
             return x
 
@@ -404,11 +405,10 @@ class Head(nn.Module):
             e(Tensor): Shape [B, L1, C]
         """
         assert e.dtype == torch.float32
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with amp_autocast(x.device, dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e.unsqueeze(2)).chunk(2, dim=2)
-            x = (
-                self.head(
-                    self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)))
+            head_input = self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)
+            x = self.head(head_input.to(self.head.weight.dtype))
         return x
 
 
@@ -580,7 +580,7 @@ class WanModel(ModelMixin, ConfigMixin):
         # time embeddings
         if t.dim() == 1:
             t = t.expand(t.size(0), seq_len)
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with amp_autocast(x.device, dtype=torch.float32):
             bt = t.size(0)
             t = t.flatten()
             e = self.time_embedding(

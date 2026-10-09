@@ -2,10 +2,11 @@
 import logging
 
 import torch
-import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+
+from device_utils import amp_autocast, resolve_device
 
 __all__ = [
     "Wan2_2_VAE",
@@ -895,11 +896,11 @@ class Wan2_2_VAE:
         dim_mult=[1, 2, 4, 4],
         temperal_downsample=[False, True, True],
         dtype=torch.float,
-        device="cuda",
+        device="auto",
     ):
 
         self.dtype = dtype
-        self.device = device
+        self.device = resolve_device(device)
 
         mean = torch.tensor(
             [
@@ -953,7 +954,7 @@ class Wan2_2_VAE:
                 -0.0667,
             ],
             dtype=dtype,
-            device=device,
+            device=self.device,
         )
         std = torch.tensor(
             [
@@ -1007,7 +1008,7 @@ class Wan2_2_VAE:
                 0.7744,
             ],
             dtype=dtype,
-            device=device,
+            device=self.device,
         )
         self.scale = [mean, 1.0 / std]
 
@@ -1019,17 +1020,17 @@ class Wan2_2_VAE:
                 dim=c_dim,
                 dim_mult=dim_mult,
                 temperal_downsample=temperal_downsample,
-            ).eval().requires_grad_(False).to(device))
+            ).eval().requires_grad_(False).to(self.device))
 
     def encode(self, videos):
-        with torch.amp.autocast("cuda", dtype=self.dtype):
+        with amp_autocast(self.device, dtype=self.dtype):
             return self.model.encode(videos, self.scale)
 
     def decode(self, zs):
         try:
             if not isinstance(zs, list):
                 raise TypeError("zs should be a list")
-            with amp.autocast(dtype=self.dtype):
+            with amp_autocast(self.device, dtype=self.dtype):
                 return [
                     self.model.decode(u.unsqueeze(0),
                                       self.scale).float().clamp_(-1,

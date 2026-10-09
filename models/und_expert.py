@@ -44,6 +44,9 @@ class UndExpertConfig:
     # Training
     eps: float = 1e-5                # Layer norm epsilon
 
+    def __post_init__(self):
+        self.eps = float(self.eps)
+
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     """

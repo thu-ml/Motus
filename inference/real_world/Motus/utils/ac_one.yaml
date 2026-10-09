@@ -40,14 +40,14 @@ dataset:
 model:
   # WAN Video Model settings
   wan:
-    config_path: "/share/home/bhz/pretrained_models/Wan2.2-TI2V-5B"
-    checkpoint_path: "/share/home/bhz/pretrained_models/Wan2.2-TI2V-5B"
-    vae_path: "/share/home/bhz/pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    config_path: "pretrained_models/Wan2.2-TI2V-5B"
+    checkpoint_path: "pretrained_models/Wan2.2-TI2V-5B"
+    vae_path: "pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
     precision: "bfloat16"
   
   # VLM settings
   vlm:
-    checkpoint_path: "/share/home/bhz/pretrained_models/Qwen3-VL-2B-Instruct"
+    checkpoint_path: "pretrained_models/Qwen3-VL-2B-Instruct"
     precision: "bfloat16"
     frozen: true              # Whether to freeze VLM parameters
   

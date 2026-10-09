@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from models.motus import Motus, MotusConfig
 from transformers import AutoProcessor
 from wan.modules.t5 import T5EncoderModel
+from utils.device import resolve_device
 
 # Load config
 with open("inference/real_world/Motus/utils/aloha_agilex_2.yml", "r") as f:
@@ -47,7 +48,7 @@ first_frame = Image.open("/path/to/image.png").convert("RGB")
 first_frame_tensor = torch.from_numpy(np.array(first_frame.resize((320, 384)))).permute(2,0,1).unsqueeze(0).float() / 255.0
 state = torch.zeros((1, config['common']['state_dim']), dtype=torch.bfloat16, device=device)
 
-# Build VLM inputs
+from utils.device import resolve_device
 processor = AutoProcessor.from_pretrained(config['model']['vlm']['checkpoint_path'], trust_remote_code=True)
 vlm_inputs = processor(text=["Pick up the cube."], images=[first_frame], return_tensors='pt')
 vlm_inputs = {k: v.to(device) for k, v in vlm_inputs.items()}
@@ -105,6 +106,7 @@ if PROJ_ROOT not in sys.path:
 from models.motus import Motus, MotusConfig
 from transformers import AutoProcessor
 from wan.modules.t5 import T5EncoderModel
+from utils.device import resolve_device
 
 
 def load_yaml_config(path: str) -> Dict[str, Any]:
@@ -160,6 +162,7 @@ def create_motus_from_yaml(config_dict: Dict[str, Any], device: torch.device) ->
     common = config_dict['common']
     model_cfg = config_dict['model']
     mc = MotusConfig(
+        device=str(device),
         wan_checkpoint_path=model_cfg['wan']['checkpoint_path'],
         vae_path=model_cfg['wan']['vae_path'],
         wan_config_path=model_cfg['wan']['config_path'],
@@ -207,11 +210,13 @@ def main():
     parser.add_argument("--image", required=True, help="Path to input image")
     parser.add_argument("--instruction", required=True, help="Instruction text")
     parser.add_argument("--output", default="inference_result.png", help="Where to save predicted frames grid")
+    parser.add_argument("--device", default="auto", choices=("auto", "cuda", "xpu", "cpu"), help="PyTorch device backend")
     parser.add_argument("--use_t5", action="store_true", help="Load T5 and encode instruction on the fly")
     parser.add_argument("--t5_embeds", default=None, help="Path to pre-encoded T5 embeddings (.pt) when not using --use_t5")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device)
+    print(f"Using PyTorch device: {device}")
 
     # Load config
     cfg = load_yaml_config(args.model_config)

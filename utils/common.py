@@ -10,6 +10,8 @@ import imageio
 from safetensors import safe_open
 import numpy as np
 
+from .device import empty_device_cache
+
 
 DTYPE_MAP = {
     'float32': torch.float32,
@@ -45,7 +47,7 @@ def zero_first():
 
 def empty_cuda_cache():
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_device_cache()
 
 
 @contextmanager

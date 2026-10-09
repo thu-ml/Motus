@@ -16,6 +16,7 @@ if BAK_ROOT not in sys.path:
     sys.path.insert(0, BAK_ROOT)
 
 from utils.common import get_t_distribution
+from utils.device import amp_autocast
 from wan.modules.model import sinusoidal_embedding_1d
 from transformers import Qwen3VLForConditionalGeneration, AutoConfig
 from .wan_model import WanVideoModel
@@ -30,6 +31,9 @@ logger = logging.getLogger(__name__)
 @dataclass 
 class MotusConfig:
     """Configuration for Motus."""
+    # Compute device: "cuda", "xpu", "cpu", or an indexed variant such as "cuda:0".
+    device: str = "cuda"
+
     # Video model settings
     wan_checkpoint_path: str = ""
     vae_path: str = ""
@@ -153,17 +157,19 @@ class VideoModule(nn.Module):
         if t_video.dim() == 1:
             t_video = t_video.unsqueeze(1).expand(t_video.size(0), seq_len)
 
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        time_embedding = self.video_model.wan_model.time_embedding
+        embedding_dtype = next(time_embedding.parameters()).dtype
+        with amp_autocast(self.device, dtype=embedding_dtype):
             bt = t_video.size(0)
             t_flat = t_video.flatten()
-            
-            t_emb = self.video_model.wan_model.time_embedding(
-                sinusoidal_embedding_1d(self.video_model.wan_model.freq_dim, t_flat).unflatten(0, (bt, seq_len)).float()
-            )
+
+            sinusoidal_embedding = sinusoidal_embedding_1d(
+                self.video_model.wan_model.freq_dim, t_flat
+            ).unflatten(0, (bt, seq_len)).to(dtype=embedding_dtype)
+            t_emb = time_embedding(sinusoidal_embedding)
             t_emb_proj = self.video_model.wan_model.time_projection(t_emb).unflatten(2, (6, 3072))
-            assert t_emb.dtype == torch.float32 and t_emb_proj.dtype == torch.float32
-            
-        return t_emb, t_emb_proj
+
+        return t_emb.float(), t_emb_proj
 
     def process_cross_attention(self, video_tokens: torch.Tensor, video_adaln_params: torch.Tensor, 
                                layer_idx: int, processed_t5_context: torch.Tensor) -> torch.Tensor:
@@ -176,7 +182,7 @@ class VideoModule(nn.Module):
     def compute_adaln_modulation(self, video_adaln_params: torch.Tensor, layer_idx: int) -> tuple:
         """Compute AdaLN modulation parameters for WAN (6 components)."""
         wan_layer = self.video_model.wan_model.blocks[layer_idx]
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with amp_autocast(self.device, dtype=torch.float32):
             modulation = (
                 wan_layer.modulation.unsqueeze(0)
                 + video_adaln_params
@@ -194,7 +200,7 @@ class VideoModule(nn.Module):
         ffn_input = wan_layer.norm2(video_tokens).float() * (1 + v_mod[4].squeeze(2)) + v_mod[3].squeeze(2)
         ffn_out = wan_layer.ffn(ffn_input)
 
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with amp_autocast(self.device, dtype=torch.float32):
             return video_tokens + ffn_out * v_mod[5].squeeze(2)
 
     def apply_output_head(self, video_tokens: torch.Tensor, video_time_emb: torch.Tensor) -> torch.Tensor:
@@ -435,7 +441,7 @@ class ActionModule(nn.Module):
         if t.dim() == 1:
             t = t.unsqueeze(1).expand(t.size(0), seq_len)
 
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with amp_autocast(self.device, dtype=torch.float32):
             bt = t.size(0)
             t_flat = t.flatten()
             
@@ -454,7 +460,7 @@ class ActionModule(nn.Module):
     def compute_adaln_modulation(self, action_adaln_params: torch.Tensor, layer_idx: int) -> tuple:
         """Compute AdaLN modulation parameters for 6 components (3 for WAN-Action joint attn + 3 for FFN)."""
         action_layer = self.action_expert.blocks[layer_idx]
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with amp_autocast(self.device, dtype=torch.float32):
             modulation = (
                 action_layer.modulation.unsqueeze(0)
                 + action_adaln_params
@@ -472,7 +478,7 @@ class ActionModule(nn.Module):
         ffn_input = action_block.norm2(action_tokens).float() * (1 + a_mod[4].squeeze(2)) + a_mod[3].squeeze(2)
         ffn_out = action_block.ffn(ffn_input)
         
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with amp_autocast(self.device, dtype=torch.float32):
             action_tokens = action_tokens + ffn_out * a_mod[5].squeeze(2)
         return action_tokens
 
@@ -505,7 +511,7 @@ class Motus(nn.Module):
             self.video_model = WanVideoModel.from_config(
                 config_path=config.wan_config_path,
                 vae_path=config.vae_path,
-                device="cuda",
+                device=config.device,
                 precision=config.video_precision
             )
 
@@ -515,15 +521,14 @@ class Motus(nn.Module):
             self.vlm_model = Qwen3VLForConditionalGeneration.from_pretrained(
                 config.vlm_checkpoint_path,
                 dtype=self.dtype,
-                device_map="cuda",
+                device_map=config.device,
                 trust_remote_code=True
             )
             logger.info("Load pretrained VLM...")
         else:
             vlm_cfg = AutoConfig.from_pretrained(config.vlm_checkpoint_path, trust_remote_code=True)
             self.vlm_model = Qwen3VLForConditionalGeneration._from_config(vlm_cfg, torch_dtype=self.dtype)
-            # Move to CUDA and dtype explicitly
-            self.vlm_model.to(device="cuda", dtype=self.dtype)
+            self.vlm_model.to(device=config.device, dtype=self.dtype)
             logger.info("Initializing VLM from config...")
 
         # Freeze VLM parameters
@@ -848,7 +853,7 @@ class Motus(nn.Module):
         processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
 
         # 3. MoT forward
-        with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
+        with amp_autocast(self.device, dtype=self.video_model.precision):
             # Process through 30 layers - modality-grouped execution
             for layer_idx in range(self.config.num_layers):
                 # Compute AdaLN modulation once per layer using pre-computed parameters
@@ -974,7 +979,7 @@ class Motus(nn.Module):
 
             
             # Trimodal MoT forward - joint denoising for WAN, Action, Understanding
-            with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
+            with amp_autocast(self.device, dtype=self.video_model.precision):
                 # Time embeddings
                 video_head_time_emb, video_adaln_params = self.video_module.get_time_embedding(video_t_scaled, video_tokens.shape[1])
                 action_head_time_emb, action_adaln_params = self.action_module.get_time_embedding(action_t_scaled, action_tokens.shape[1])
@@ -1147,7 +1152,7 @@ class Motus(nn.Module):
                 und_tokens = self.und_module.extract_und_features(vlm_inputs)
                 
                 # Model forward pass
-                with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
+                with amp_autocast(self.device, dtype=self.video_model.precision):
                     # Time embeddings (t is in [0, 1000] from scheduler)
                     video_t_scaled = t.expand(1).to(self.dtype)
                     action_t_scaled = t.expand(1).to(self.dtype)
@@ -1296,7 +1301,7 @@ class Motus(nn.Module):
             # Re-extract understanding features per step (keeps alignment with current pipeline)
             und_tokens = self.und_module.extract_und_features(vlm_inputs)
             
-            with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
+            with amp_autocast(self.device, dtype=self.video_model.precision):
                 # Time embeddings: use the current discrete t (0..num_train_timesteps)
                 t_scalar = t.to(self.dtype).repeat(B)
                 video_head_time_emb, video_adaln_params = self.video_module.get_time_embedding(t_scalar, video_tokens.shape[1])

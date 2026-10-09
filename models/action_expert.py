@@ -21,6 +21,7 @@ if str(bak_root.resolve()) not in sys.path:
 
 from wan.modules.attention import flash_attention
 from wan.modules.model import WanRMSNorm, WanLayerNorm, sinusoidal_embedding_1d, rope_apply
+from utils.device import amp_autocast
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,7 @@ class ActionExpertConfig:
     
     def __post_init__(self):
         """Validate configuration."""
+        self.eps = float(self.eps)
         assert self.chunk_size >= 2, "chunk_size must be at least 2 (1 state + 1 action)"
 
 class StateActionEncoder(nn.Module):
@@ -298,7 +300,7 @@ class ActionDecoder(nn.Module):
             Action predictions [B, chunk_size, action_dim]
         """
         # WAN Head-style modulation using time_emb
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with amp_autocast(x.device, dtype=torch.float32):
             e0, e1 = (self.modulation.unsqueeze(0) + time_emb.unsqueeze(2)).chunk(2, dim=2)
         z = self.norm(x) * (1 + e1.squeeze(2)) + e0.squeeze(2)
         return self.action_head(z)

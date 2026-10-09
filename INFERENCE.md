@@ -60,6 +60,30 @@ python inference/real_world/Motus/inference_example.py \
   --output examples/output_ac_one.png
 ```
 
+**Intel XPU:**
+
+Install the XPU-enabled PyTorch wheels in the inference environment:
+```bash
+python -m pip install --force-reinstall torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/xpu
+```
+
+Run inference with the XPU backend and pre-encoded T5 embeddings:
+```bash
+python inference/real_world/Motus/inference_example.py \
+  --model_config inference/real_world/Motus/utils/ac_one.yaml \
+  --ckpt_dir pretrained_models/Motus \
+  --wan_path pretrained_models \
+  --image examples/first_frame.png \
+  --instruction "Pour water from kettle to flowers" \
+  --t5_embeds t5_embed.pt \
+  --device xpu \
+  --output examples/output_ac_one_xpu.png
+```
+
+On XPU, Motus uses PyTorch scaled dot-product attention instead of CUDA
+FlashAttention. XPU execution currently targets a single device.
+
 **Output:**
 - `examples/output_ac_one.png`: Grid of condition frame + predicted future frames
 - Console: Predicted action chunk with shape `(action_chunk_size, action_dim)`
